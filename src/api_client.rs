@@ -15,8 +15,6 @@ pub enum ApiError {
     Api { status: u16, body: String },
     #[error("Auth failed: {0}")]
     Auth(String),
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, ApiError>;
@@ -68,20 +66,17 @@ pub struct DataApiClient {
 }
 
 impl DataApiClient {
-    /// Authenticate with the Data API using the admission token file.
+    /// Authenticate with the Data API using a shared secret.
     pub async fn authenticate(
         base_url: &str,
-        admission_token_path: &str,
+        shared_secret: &str,
         service_name: &str,
     ) -> Result<Self> {
-        let admission_token = std::fs::read_to_string(admission_token_path)
-            .map_err(|e| ApiError::Auth(format!("failed to read admission token: {}", e)))?;
-
         let client = Client::new();
         let resp = client
             .post(format!("{}/internal/auth", base_url))
             .json(&serde_json::json!({
-                "admission_token": admission_token.trim(),
+                "shared_secret": shared_secret,
                 "service_name": service_name,
             }))
             .send()

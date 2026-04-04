@@ -1,7 +1,7 @@
 /// Worker configuration from environment variables.
 pub struct Config {
     pub data_api_url: String,
-    pub admission_token_path: String,
+    pub shared_secret: String,
     pub whisper_url: String,
     pub whisper_model: String,
     pub vad_model_path: String,
@@ -18,8 +18,8 @@ impl Config {
         Self {
             data_api_url: std::env::var("DATA_API_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:8001".into()),
-            admission_token_path: std::env::var("DATA_API_ADMISSION_PATH")
-                .unwrap_or_else(|_| "/var/run/ovp/admission-token".into()),
+            shared_secret: std::env::var("DATA_API_SHARED_SECRET")
+                .expect("DATA_API_SHARED_SECRET must be set"),
             whisper_url: std::env::var("WHISPER_URL")
                 .unwrap_or_else(|_| "http://localhost:8300/v1/audio/transcriptions".into()),
             whisper_model: std::env::var("WHISPER_MODEL")

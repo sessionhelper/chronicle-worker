@@ -31,7 +31,7 @@ async fn main() {
     // Authenticate with Data API
     let api = match api_client::DataApiClient::authenticate(
         &config.data_api_url,
-        &config.admission_token_path,
+        &config.shared_secret,
         "pipeline",
     )
     .await
