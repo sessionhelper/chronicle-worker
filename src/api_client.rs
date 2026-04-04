@@ -27,24 +27,16 @@ struct AuthResponse {
 #[derive(Deserialize, Debug, Clone)]
 pub struct Session {
     pub id: Uuid,
-    pub guild_id: Option<i64>,
-    pub status: Option<String>,
-    pub s3_prefix: Option<String>,
-    pub participant_count: Option<i32>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct Participant {
-    pub id: Uuid,
-    pub user_id: Uuid,
     pub pseudo_id: Option<String>,
     pub consent_scope: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
 pub struct ChunkInfo {
-    pub key: String,
-    pub size: u64,
     pub seq: u32,
 }
 

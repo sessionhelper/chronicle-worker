@@ -7,7 +7,6 @@
 //! - **Batch**: Picks up completed sessions (status=uploaded) and processes
 //!   all chunks at once. Fallback for sessions that weren't live-processed.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -26,26 +25,6 @@ pub enum WorkerError {
     Api(#[from] crate::api_client::ApiError),
     #[error("Pipeline error: {0}")]
     Pipeline(#[from] ovp_pipeline::PipelineError),
-}
-
-/// State for tracking which chunks we've already seen per session/speaker.
-struct SessionTracker {
-    /// Per-speaker: last chunk sequence number we've processed.
-    speaker_progress: HashMap<String, u32>,
-    /// Accumulated mono f32 samples per speaker (appended as chunks arrive).
-    speaker_samples: HashMap<String, Vec<f32>>,
-    /// Total segments emitted so far.
-    segments_emitted: u32,
-}
-
-impl SessionTracker {
-    fn new() -> Self {
-        Self {
-            speaker_progress: HashMap::new(),
-            speaker_samples: HashMap::new(),
-            segments_emitted: 0,
-        }
-    }
 }
 
 /// Decode raw s16le stereo PCM bytes to mono f32 samples.
