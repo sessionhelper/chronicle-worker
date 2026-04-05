@@ -16,6 +16,7 @@
 
 pub mod api_client;
 pub mod config;
+pub mod decode;
 pub mod state;
 pub mod worker;
 
