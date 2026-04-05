@@ -84,18 +84,48 @@ pub struct SessionDetail {
     pub ended_at: Option<DateTime<Utc>>,
 }
 
+/// A session participant as returned by `GET /internal/sessions/{id}/participants`.
+///
+/// The Data API joins `users.pseudo_id` onto the participant row so the
+/// worker has everything it needs to address audio chunks in S3 without
+/// a second round trip per participant. `user_pseudo_id` is `None` for
+/// participant rows that were never linked to a concrete user (shouldn't
+/// happen in production — the collector always upserts a user first —
+/// but the JOIN is LEFT so the field is still Optional on the wire).
+///
+/// `consent_scope` is the collector's current wire-level consent field
+/// (today: `"full"` or `"decline"`). License flags (`no_llm_training`,
+/// `no_public_release`) gate *downstream publication*, not transcription,
+/// so the worker does not read them. See `worker::process_next_session`
+/// for the filter rule.
 #[derive(Deserialize, Debug, Clone)]
 pub struct Participant {
     pub id: Uuid,
-    pub pseudo_id: Option<String>,
+    pub user_id: Option<Uuid>,
+    #[serde(default)]
+    pub user_pseudo_id: Option<String>,
+    #[serde(default)]
     pub consent_scope: Option<String>,
+}
+
+/// Metadata about a single audio chunk, as returned by the
+/// `list_chunks` endpoint. Only `seq` is load-bearing for the worker —
+/// `size` is kept for diagnostics and metrics, `key` for log correlation.
+#[derive(Deserialize, Debug, Clone)]
+pub struct ChunkInfo {
+    #[allow(dead_code)]
+    pub key: String,
+    pub seq: u32,
+    #[allow(dead_code)]
+    pub size: i64,
 }
 
 /// Transcript segment posted back to the Data API after pipeline processing.
 ///
 /// Wire format matches `ovp-data-api/src/routes/segments.rs` ->
-/// `bulk_create_segments`. Fields mirror `ovp_pipeline::TranscriptSegment`
-/// but with `i32`/`f64` for DB compatibility.
+/// `bulk_create_segments` (a bare JSON array of `CreateSegment`). Field
+/// types are `i32`/`f64` to match the DB column types — not `usize`/`f32`
+/// which would force conversions on both sides.
 #[derive(Serialize, Debug, Clone)]
 pub struct Segment {
     pub segment_index: i32,
@@ -166,12 +196,6 @@ impl DataApiClient {
 
     // ----- Session discovery -------------------------------------------
 
-    // TODO(data-api): `GET /internal/sessions?status=uploaded` does NOT
-    // exist today. `ovp-data-api/src/routes/sessions.rs::list_sessions`
-    // only filters by `user_pseudo_id`. Before A1 can run end-to-end,
-    // add a status-filter branch to that handler (or a new
-    // `/internal/sessions/by-status/{status}` route) that returns
-    // `Vec<db::Session>` ordered by `started_at ASC`.
     /// List sessions in the `uploaded` state, oldest first.
     pub async fn list_uploaded_sessions(&self) -> Result<Vec<SessionSummary>> {
         let resp = self
@@ -194,8 +218,9 @@ impl DataApiClient {
         Ok(check_status(resp).await?.json().await?)
     }
 
-    /// List all participants for a session. Caller filters by
-    /// `consent_scope == "full"` — the API returns everyone.
+    /// List all participants for a session. The API returns everyone,
+    /// including withdrawn and declined rows — the worker is responsible
+    /// for filtering to consented participants before downloading audio.
     pub async fn list_participants(&self, session_id: Uuid) -> Result<Vec<Participant>> {
         let resp = self
             .client
@@ -211,19 +236,34 @@ impl DataApiClient {
 
     // ----- Audio chunk download ----------------------------------------
 
-    // TODO(data-api): verify that `GET /internal/sessions/{id}/audio/
-    // {pseudo_id}/chunk/{seq}` actually streams back raw PCM bytes with
-    // content-type `application/octet-stream`. Route is declared in
-    // `ovp-data-api/src/routes/audio.rs::download_chunk` — confirm its
-    // body format before wiring the PCM decoder.
-    //
-    // TODO(worker): there's no `list_chunks` call here because the spec
-    // asks for `download_chunk(session_id, pseudo_id, chunk_seq)`. Once
-    // `process_next_session` is implemented, it will need to either
-    // enumerate chunk sequences (add `list_chunks` back) or the data
-    // API grows a `GET /sessions/{id}/audio/{pseudo_id}` that streams
-    // the full concatenated PCM blob in one call.
+    /// Enumerate all audio chunks for one speaker in one session.
+    ///
+    /// Returned chunks are sorted oldest-first by `seq` (the Data API
+    /// guarantees this in `storage::audio::list_chunks`). Callers must
+    /// preserve that order when concatenating raw bytes — PCM is not
+    /// self-synchronizing, so a reorder would corrupt timestamps.
+    pub async fn list_chunks(
+        &self,
+        session_id: Uuid,
+        pseudo_id: &str,
+    ) -> Result<Vec<ChunkInfo>> {
+        let resp = self
+            .client
+            .get(format!(
+                "{}/internal/sessions/{session_id}/audio/{pseudo_id}/chunks",
+                self.base_url
+            ))
+            .header("authorization", self.auth_header())
+            .send()
+            .await?;
+        Ok(check_status(resp).await?.json().await?)
+    }
+
     /// Download one raw-PCM audio chunk by sequence number.
+    ///
+    /// The Data API streams these back as s16le stereo 48kHz bytes with
+    /// `Content-Type: audio/pcm`. The worker handles decoding; see
+    /// `crate::decode::decode_stereo_to_mono`.
     pub async fn download_chunk(
         &self,
         session_id: Uuid,
@@ -244,13 +284,11 @@ impl DataApiClient {
 
     // ----- Segment upload ----------------------------------------------
 
-    // TODO(data-api): confirm the wire shape expected by
-    // `ovp-data-api/src/routes/segments.rs::bulk_create_segments` —
-    // in particular whether it wants a bare JSON array (`Vec<Segment>`)
-    // or an envelope like `{"segments": [...]}`. The collector's
-    // client doesn't post segments, so there's no existing precedent
-    // to copy from. Adjust the body of this method once confirmed.
     /// Bulk-post transcript segments for a session.
+    ///
+    /// The Data API route (`bulk_create_segments`) deserializes a bare
+    /// JSON array of `CreateSegment`, so we serialize `Vec<Segment>`
+    /// directly — no envelope.
     pub async fn post_segments(
         &self,
         session_id: Uuid,
