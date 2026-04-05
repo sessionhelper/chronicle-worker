@@ -3,6 +3,13 @@ name = "ovp-worker"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "ovp-worker"
+path = "src/main.rs"
+
 [dependencies]
 ovp-pipeline = { path = "../ovp-pipeline", features = ["vad", "transcribe"] }
 tokio = { version = "1", features = ["full"] }
@@ -10,6 +17,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
