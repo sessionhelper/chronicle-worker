@@ -339,7 +339,18 @@ pub async fn process_next_session(
         "posting_results"
     );
 
-    state.api.post_segments(session_id, segments_out).await?;
+    // Post segments in small batches so the data-api broadcasts
+    // SegmentAdded events progressively and the frontend can render
+    // segments as they arrive instead of waiting for the full batch.
+    // The 50ms delay between batches gives the frontend time to
+    // process and render each batch.
+    for batch in segments_out.chunks(5) {
+        state
+            .api
+            .post_segments(session_id, batch.to_vec())
+            .await?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     if !beats_out.is_empty() {
         state.api.post_beats(session_id, beats_out).await?;
