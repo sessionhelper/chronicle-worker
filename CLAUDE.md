@@ -32,15 +32,28 @@ src/
   config.rs      — clap-derived env config
   state.rs       — AppState: Arc<DataApiClient> + Config
   api_client.rs  — HTTP client: auth, heartbeat, sessions, chunks, segments
+  decode.rs      — PCM decode: stereo s16le bytes → mono f32 samples
   worker.rs      — run() + process_next_session(), the polling loop
 ```
 
-## Scaffolding status
+## Env vars
 
-This tree is a skeleton. Real implementation lives behind `TODO:` comments — `rg 'TODO' src/` gives an ordered checklist. Known missing pieces:
+| Var | Required | Default |
+|---|---|---|
+| `DATA_API_URL` | yes | — |
+| `DATA_API_SHARED_SECRET` | yes | — |
+| `POLL_INTERVAL_SECS` | no | `10` |
+| `WHISPER_URL` | yes | — |
+| `WHISPER_MODEL` | no | `deepdml/faster-whisper-large-v3-turbo-ct2` |
+| `VAD_MODEL_PATH` | yes | — |
+| `LOG_LEVEL` | no | `info` |
 
-- `GET /internal/sessions?status=uploaded` does not exist in `ovp-data-api` yet (`src/routes/sessions.rs::list_sessions` only filters by user).
-- PCM decode, pipeline invocation, and segment mapping are stubbed as empty `Vec`s.
-- Segment POST wire-format unconfirmed against `ovp-data-api/src/routes/segments.rs::bulk_create_segments`.
+## Build
 
-Do not modify `ovp-pipeline` — it's a fixed dependency. If a new endpoint is needed on `ovp-data-api`, add it there and update the worker's client to match.
+```bash
+cargo build --release
+
+# Docker (build context must include both ovp-worker/ and ovp-pipeline/)
+cd /home/alex
+docker build -f ovp-worker/Dockerfile -t ovp-worker:dev .
+```
