@@ -135,6 +135,36 @@ pub struct Segment {
     pub text: String,
     pub original_text: String,
     pub confidence: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub beat_id: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_group: Option<i32>,
+    #[serde(default)]
+    pub excluded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclude_reason: Option<String>,
+}
+
+/// Narrative beat posted to the Data API after pipeline processing.
+#[derive(Serialize, Debug, Clone)]
+pub struct Beat {
+    pub beat_index: i32,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub title: String,
+    pub summary: String,
+}
+
+/// Scene grouping posted to the Data API after pipeline processing.
+#[derive(Serialize, Debug, Clone)]
+pub struct Scene {
+    pub scene_index: i32,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub title: String,
+    pub summary: String,
+    pub beat_start: i32,
+    pub beat_end: i32,
 }
 
 // ---------------------------------------------------------------------------
@@ -285,10 +315,6 @@ impl DataApiClient {
     // ----- Segment upload ----------------------------------------------
 
     /// Bulk-post transcript segments for a session.
-    ///
-    /// The Data API route (`bulk_create_segments`) deserializes a bare
-    /// JSON array of `CreateSegment`, so we serialize `Vec<Segment>`
-    /// directly — no envelope.
     pub async fn post_segments(
         &self,
         session_id: Uuid,
@@ -302,6 +328,46 @@ impl DataApiClient {
             ))
             .header("authorization", self.auth_header())
             .json(&segments)
+            .send()
+            .await?;
+        check_status(resp).await?;
+        Ok(())
+    }
+
+    /// Bulk-post narrative beats for a session.
+    pub async fn post_beats(
+        &self,
+        session_id: Uuid,
+        beats: Vec<Beat>,
+    ) -> Result<()> {
+        let resp = self
+            .client
+            .post(format!(
+                "{}/internal/sessions/{session_id}/beats",
+                self.base_url
+            ))
+            .header("authorization", self.auth_header())
+            .json(&beats)
+            .send()
+            .await?;
+        check_status(resp).await?;
+        Ok(())
+    }
+
+    /// Bulk-post scene groupings for a session.
+    pub async fn post_scenes(
+        &self,
+        session_id: Uuid,
+        scenes: Vec<Scene>,
+    ) -> Result<()> {
+        let resp = self
+            .client
+            .post(format!(
+                "{}/internal/sessions/{session_id}/scenes",
+                self.base_url
+            ))
+            .header("authorization", self.auth_header())
+            .json(&scenes)
             .send()
             .await?;
         check_status(resp).await?;

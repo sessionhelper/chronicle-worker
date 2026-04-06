@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
-use crate::api_client::{ApiError, Participant, Segment, SessionSummary};
+use crate::api_client::{ApiError, Beat, Participant, Scene, Segment, SessionSummary};
 use crate::decode::decode_stereo_to_mono;
 use crate::state::AppState;
 
@@ -286,11 +286,10 @@ pub async fn process_next_session(
         .run(&pipeline_config, SessionInput { session_id, tracks })
         .await?;
 
-    // ---- 5. Post segments back ---------------------------------------
+    // ---- 5. Post segments + beats + scenes -----------------------------
     let segments_out: Vec<Segment> = result
         .segments
         .into_iter()
-        .filter(|s| !s.excluded)
         .map(|s| Segment {
             segment_index: s.segment_index as i32,
             speaker_pseudo_id: s.speaker_pseudo_id,
@@ -299,15 +298,55 @@ pub async fn process_next_session(
             text: s.text,
             original_text: s.original_text,
             confidence: s.confidence.map(|c| c as f64),
+            beat_id: s.beat_id.map(|b| b as i32),
+            chunk_group: s.chunk_group.map(|c| c as i32),
+            excluded: s.excluded,
+            exclude_reason: s.exclude_reason,
+        })
+        .collect();
+
+    let beats_out: Vec<Beat> = result
+        .beats
+        .into_iter()
+        .map(|b| Beat {
+            beat_index: b.beat_index as i32,
+            start_time: b.start_time as f64,
+            end_time: b.end_time as f64,
+            title: b.title,
+            summary: b.summary,
+        })
+        .collect();
+
+    let scenes_out: Vec<Scene> = result
+        .scenes
+        .into_iter()
+        .map(|s| Scene {
+            scene_index: s.scene_index as i32,
+            start_time: s.start_time as f64,
+            end_time: s.end_time as f64,
+            title: s.title,
+            summary: s.summary,
+            beat_start: s.beat_start as i32,
+            beat_end: s.beat_end as i32,
         })
         .collect();
 
     tracing::info!(
         session_id = %session_id,
-        segment_count = segments_out.len(),
-        "posting segments"
+        segments = segments_out.len(),
+        beats = beats_out.len(),
+        scenes = scenes_out.len(),
+        "posting_results"
     );
+
     state.api.post_segments(session_id, segments_out).await?;
+
+    if !beats_out.is_empty() {
+        state.api.post_beats(session_id, beats_out).await?;
+    }
+    if !scenes_out.is_empty() {
+        state.api.post_scenes(session_id, scenes_out).await?;
+    }
 
     // ---- 6. Finalize state -------------------------------------------
     state
