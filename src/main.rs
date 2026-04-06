@@ -1,74 +1,91 @@
-//! OVP Pipeline Worker
+//! `ovp-worker` binary entrypoint.
 //!
-//! Polls the Data API for sessions ready for transcription, downloads
-//! audio, runs the ovp-pipeline, and posts results back. Never touches
-//! Postgres or S3 directly — everything goes through the Data API.
+//! Responsibilities (kept deliberately thin):
+//!
+//! 1. Init tracing from `LOG_LEVEL` (or `RUST_LOG`).
+//! 2. Parse `Config` from env via `clap`.
+//! 3. Authenticate with the Data API → `DataApiClient`.
+//! 4. Build `AppState` and spawn the 30s heartbeat task.
+//! 5. Hand control to `worker::run(state).await`.
+//!
+//! All orchestration lives in [`ovp_worker::worker`].
 
-mod api_client;
-mod config;
-mod worker;
-
+use std::sync::Arc;
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+use ovp_worker::api_client::DataApiClient;
+use ovp_worker::config::Config;
+use ovp_worker::state::AppState;
+use ovp_worker::worker;
+use tracing_subscriber::EnvFilter;
 
-    let config = config::Config::from_env();
+#[tokio::main]
+async fn main() -> anyhow_lite::Result<()> {
+    // ---- Config (parse before tracing so LOG_LEVEL applies) ----------
+    let config = Config::from_env();
+
+    // ---- Tracing init ------------------------------------------------
+    // Prefer RUST_LOG if set, otherwise fall back to the config's
+    // log_level. Mirrors the collector's init shape.
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(&config.log_level));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .init();
 
     tracing::info!(
         data_api = %config.data_api_url,
-        whisper = %config.whisper_url,
-        poll_interval = config.poll_interval_secs,
-        "pipeline worker starting"
+        poll_interval_secs = config.poll_interval_secs,
+        "ovp-worker starting"
     );
 
-    // Authenticate with Data API
-    let api = match api_client::DataApiClient::authenticate(
+    // ---- Authenticate ------------------------------------------------
+    let api = DataApiClient::authenticate(
         &config.data_api_url,
         &config.shared_secret,
-        "pipeline",
+        "ovp-worker",
     )
     .await
-    {
-        Ok(client) => client,
-        Err(e) => {
-            tracing::error!(error = %e, "failed to authenticate with Data API");
-            std::process::exit(1);
-        }
-    };
+    .map_err(|e| anyhow_lite::err(format!("data api auth failed: {e}")))?;
+    let api = Arc::new(api);
 
-    let api = std::sync::Arc::new(api);
+    // ---- Build shared state ------------------------------------------
+    let state = AppState::new(api.clone(), config);
 
-    // Spawn heartbeat
+    // ---- Spawn 30s heartbeat task ------------------------------------
+    // TODO: on repeated heartbeat failures (e.g. 3 in a row), consider
+    // re-authenticating instead of spamming warnings — the Data API
+    // reaps sessions after 90s of silence, so a token that's already
+    // been reaped will never recover on its own.
     let hb_api = api.clone();
     tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        // Skip the immediate first tick — authenticate already talked
+        // to the server, no need to hit it again 0s later.
+        tick.tick().await;
         loop {
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            tick.tick().await;
             if let Err(e) = hb_api.heartbeat().await {
                 tracing::warn!(error = %e, "heartbeat failed");
             }
         }
     });
 
-    // Poll loop
-    let poll_interval = Duration::from_secs(config.poll_interval_secs);
-    loop {
-        match worker::poll_and_process(&api, &config).await {
-            Ok(processed) => {
-                if processed > 0 {
-                    tracing::info!(sessions = processed, "processed sessions");
-                }
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "worker error");
-            }
-        }
-        tokio::time::sleep(poll_interval).await;
+    // ---- Enter the worker loop (blocks forever) ----------------------
+    worker::run(state)
+        .await
+        .map_err(|e| anyhow_lite::err(format!("worker loop exited: {e}")))?;
+
+    Ok(())
+}
+
+/// Tiny inline error-returning shim so we don't pull in the full
+/// `anyhow` crate just for `main`'s return type. Ten lines of code
+/// beats adding a dep for two uses.
+mod anyhow_lite {
+    pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+    pub fn err(msg: String) -> Box<dyn std::error::Error + Send + Sync> {
+        msg.into()
     }
 }
