@@ -48,6 +48,8 @@ impl PipelineRunner for CapturingStubRunner {
             *captured.lock().unwrap() = Some(input);
             Ok(PipelineResult {
                 segments: vec![canned],
+                beats: Vec::new(),
+                scenes: Vec::new(),
                 segments_produced: 1,
                 segments_excluded: 0,
                 scenes_detected: 1,
