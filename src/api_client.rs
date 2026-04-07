@@ -178,6 +178,25 @@ pub struct DataApiClient {
 }
 
 impl DataApiClient {
+    /// The bearer token for this authenticated session. Needed by the WS
+    /// client which passes it as a query parameter on the upgrade request.
+    pub fn session_token(&self) -> &str {
+        &self.session_token
+    }
+
+    /// Build the WebSocket URL for the data-api event bus, including the
+    /// auth token as a query parameter. Converts `http(s)://` to `ws(s)://`.
+    pub fn ws_url(&self) -> String {
+        let ws_base = if self.base_url.starts_with("https") {
+            self.base_url.replacen("https", "wss", 1)
+        } else {
+            self.base_url.replacen("http", "ws", 1)
+        };
+        format!("{ws_base}/ws?token={}", self.session_token)
+    }
+}
+
+impl DataApiClient {
     /// Authenticate with the Data API via shared secret and return a
     /// client ready to make authenticated requests.
     pub async fn authenticate(
