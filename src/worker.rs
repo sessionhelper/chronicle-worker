@@ -162,7 +162,7 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
     tracing::info!("worker event loop starting");
 
     loop {
-        let ws_url = state.api.ws_url();
+        let ws_url = state.api.ws_url().await;
         tracing::info!(url = %ws_url.split('?').next().unwrap_or(&ws_url), "connecting to data-api WS");
 
         match tokio_tungstenite::connect_async(&ws_url).await {
@@ -351,12 +351,37 @@ pub async fn process_next_session(
         ordered.sort_by_key(|c| c.seq);
 
         let mut raw: Vec<u8> = Vec::new();
-        for chunk in ordered {
-            let bytes = state
+        let mut failed_chunks = 0u32;
+        for chunk in &ordered {
+            match state
                 .api
-                .download_chunk(session_id, pseudo_id, chunk.seq)
-                .await?;
-            raw.extend_from_slice(&bytes);
+                .download_chunk_with_retry(session_id, pseudo_id, chunk.seq)
+                .await
+            {
+                Ok(bytes) => raw.extend_from_slice(&bytes),
+                Err(e) => {
+                    // Log and skip — the pipeline can work with partial
+                    // audio. A missing chunk means a gap in this speaker's
+                    // timeline, not a session failure.
+                    failed_chunks += 1;
+                    tracing::warn!(
+                        session_id = %session_id,
+                        pseudo_id,
+                        chunk_seq = chunk.seq,
+                        error = %e,
+                        "chunk download failed after retries, skipping"
+                    );
+                }
+            }
+        }
+        if failed_chunks > 0 {
+            tracing::warn!(
+                session_id = %session_id,
+                pseudo_id,
+                failed_chunks,
+                total_chunks = ordered.len(),
+                "some chunks could not be downloaded"
+            );
         }
 
         let samples = decode_stereo_to_mono(&raw);
