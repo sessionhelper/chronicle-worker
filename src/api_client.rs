@@ -10,9 +10,12 @@
 //! service auth". One `POST /internal/auth` at startup, then a token
 //! the server reaps after 90s of heartbeat silence.
 
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -174,7 +177,31 @@ pub struct Scene {
 pub struct DataApiClient {
     client: Client,
     base_url: String,
-    session_token: String,
+    session_token: RwLock<String>,
+    /// Stored for re-authentication on 401.
+    shared_secret: String,
+    /// Stored for re-authentication on 401.
+    service_name: String,
+}
+
+impl DataApiClient {
+    /// The bearer token for this authenticated session. Needed by the WS
+    /// client which passes it as a query parameter on the upgrade request.
+    pub async fn session_token(&self) -> String {
+        self.session_token.read().await.clone()
+    }
+
+    /// Build the WebSocket URL for the data-api event bus, including the
+    /// auth token as a query parameter. Converts `http(s)://` to `ws(s)://`.
+    pub async fn ws_url(&self) -> String {
+        let token = self.session_token.read().await;
+        let ws_base = if self.base_url.starts_with("https") {
+            self.base_url.replacen("https", "wss", 1)
+        } else {
+            self.base_url.replacen("http", "ws", 1)
+        };
+        format!("{ws_base}/ws?token={}", *token)
+    }
 }
 
 impl DataApiClient {
@@ -186,6 +213,25 @@ impl DataApiClient {
         service_name: &str,
     ) -> Result<Self> {
         let client = Client::new();
+        let token = Self::do_auth(&client, base_url, shared_secret, service_name).await?;
+        tracing::info!(service = service_name, "authenticated with Data API");
+
+        Ok(Self {
+            client,
+            base_url: base_url.to_string(),
+            session_token: RwLock::new(token),
+            shared_secret: shared_secret.to_string(),
+            service_name: service_name.to_string(),
+        })
+    }
+
+    /// Perform the auth handshake and return the session token.
+    async fn do_auth(
+        client: &Client,
+        base_url: &str,
+        shared_secret: &str,
+        service_name: &str,
+    ) -> Result<String> {
         let resp = client
             .post(format!("{base_url}/internal/auth"))
             .json(&AuthRequest { shared_secret, service_name })
@@ -199,17 +245,22 @@ impl DataApiClient {
         }
 
         let auth: AuthResponse = resp.json().await?;
-        tracing::info!(service = service_name, "authenticated with Data API");
-
-        Ok(Self {
-            client,
-            base_url: base_url.to_string(),
-            session_token: auth.session_token,
-        })
+        Ok(auth.session_token)
     }
 
-    fn auth_header(&self) -> String {
-        format!("Bearer {}", self.session_token)
+    /// Re-authenticate with the Data API, replacing the stored session
+    /// token. Called when a request returns 401 (token expired).
+    pub async fn re_authenticate(&self) -> Result<()> {
+        let token =
+            Self::do_auth(&self.client, &self.base_url, &self.shared_secret, &self.service_name)
+                .await?;
+        *self.session_token.write().await = token;
+        tracing::info!(service = %self.service_name, "re-authenticated with Data API");
+        Ok(())
+    }
+
+    async fn auth_header(&self) -> String {
+        format!("Bearer {}", self.session_token.read().await)
     }
 
     /// 30s heartbeat. Server reaps sessions inactive >90s.
@@ -217,7 +268,7 @@ impl DataApiClient {
         let resp = self
             .client
             .post(format!("{}/internal/heartbeat", self.base_url))
-            .header("authorization", self.auth_header())
+            .header("authorization", self.auth_header().await)
             .send()
             .await?;
         check_status(resp).await?;
@@ -231,7 +282,7 @@ impl DataApiClient {
         let resp = self
             .client
             .get(format!("{}/internal/sessions?status=uploaded", self.base_url))
-            .header("authorization", self.auth_header())
+            .header("authorization", self.auth_header().await)
             .send()
             .await?;
         Ok(check_status(resp).await?.json().await?)
@@ -242,7 +293,7 @@ impl DataApiClient {
         let resp = self
             .client
             .get(format!("{}/internal/sessions/{session_id}", self.base_url))
-            .header("authorization", self.auth_header())
+            .header("authorization", self.auth_header().await)
             .send()
             .await?;
         Ok(check_status(resp).await?.json().await?)
@@ -258,7 +309,7 @@ impl DataApiClient {
                 "{}/internal/sessions/{session_id}/participants",
                 self.base_url
             ))
-            .header("authorization", self.auth_header())
+            .header("authorization", self.auth_header().await)
             .send()
             .await?;
         Ok(check_status(resp).await?.json().await?)
@@ -283,17 +334,20 @@ impl DataApiClient {
                 "{}/internal/sessions/{session_id}/audio/{pseudo_id}/chunks",
                 self.base_url
             ))
-            .header("authorization", self.auth_header())
+            .header("authorization", self.auth_header().await)
             .send()
             .await?;
         Ok(check_status(resp).await?.json().await?)
     }
 
-    /// Download one raw-PCM audio chunk by sequence number.
+    /// Download one raw-PCM audio chunk by sequence number (no retry).
     ///
     /// The Data API streams these back as s16le stereo 48kHz bytes with
     /// `Content-Type: audio/pcm`. The worker handles decoding; see
     /// `crate::decode::decode_stereo_to_mono`.
+    ///
+    /// Prefer [`download_chunk_with_retry`] in production code paths —
+    /// this bare version exists for internal use and tests.
     pub async fn download_chunk(
         &self,
         session_id: Uuid,
@@ -306,10 +360,104 @@ impl DataApiClient {
                 "{}/internal/sessions/{session_id}/audio/{pseudo_id}/chunk/{chunk_seq}",
                 self.base_url
             ))
-            .header("authorization", self.auth_header())
+            .header("authorization", self.auth_header().await)
             .send()
             .await?;
         Ok(check_status(resp).await?.bytes().await?.to_vec())
+    }
+
+    /// Download one audio chunk with retry on transient errors.
+    ///
+    /// Retry policy:
+    /// - **5xx** (server error): retry up to 3 times with 1s, 2s, 4s backoff.
+    /// - **401** (unauthorized): re-authenticate once and retry. If re-auth
+    ///   itself fails, propagate the error.
+    /// - **404**: returned as-is (signals end-of-chunks to some callers).
+    /// - **4xx** (other client errors): fail immediately, no retry.
+    pub async fn download_chunk_with_retry(
+        &self,
+        session_id: Uuid,
+        pseudo_id: &str,
+        chunk_seq: u32,
+    ) -> Result<Vec<u8>> {
+        const MAX_RETRIES: u32 = 3;
+        let backoff_durations = [
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(4),
+        ];
+
+        let mut attempt = 0u32;
+        loop {
+            let url = format!(
+                "{}/internal/sessions/{session_id}/audio/{pseudo_id}/chunk/{chunk_seq}",
+                self.base_url
+            );
+            let resp = self
+                .client
+                .get(&url)
+                .header("authorization", self.auth_header().await)
+                .send()
+                .await?;
+
+            let status = resp.status().as_u16();
+
+            if resp.status().is_success() {
+                return Ok(resp.bytes().await?.to_vec());
+            }
+
+            // 401 — token expired, re-auth once and retry immediately.
+            if status == 401 {
+                tracing::warn!(
+                    session_id = %session_id,
+                    pseudo_id,
+                    chunk_seq,
+                    "chunk download got 401, re-authenticating"
+                );
+                self.re_authenticate().await?;
+                // Retry once after re-auth; if it fails again we fall
+                // through to the normal retry/error path below.
+                let retry_resp = self
+                    .client
+                    .get(&url)
+                    .header("authorization", self.auth_header().await)
+                    .send()
+                    .await?;
+                return if retry_resp.status().is_success() {
+                    Ok(retry_resp.bytes().await?.to_vec())
+                } else {
+                    let s = retry_resp.status().as_u16();
+                    let body = retry_resp.text().await.unwrap_or_default();
+                    Err(ApiError::Status { status: s, body })
+                };
+            }
+
+            // 5xx — transient server error, retry with backoff.
+            if status >= 500 {
+                attempt += 1;
+                if attempt <= MAX_RETRIES {
+                    let delay = backoff_durations[(attempt - 1) as usize];
+                    tracing::warn!(
+                        session_id = %session_id,
+                        pseudo_id,
+                        chunk_seq,
+                        status,
+                        attempt,
+                        delay_ms = delay.as_millis() as u64,
+                        "chunk download failed (5xx), retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                // Exhausted retries.
+                let body = resp.text().await.unwrap_or_default();
+                return Err(ApiError::Status { status, body });
+            }
+
+            // 4xx (not 401) — client error, fail immediately.
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ApiError::Status { status, body });
+        }
     }
 
     // ----- Segment upload ----------------------------------------------
@@ -326,7 +474,7 @@ impl DataApiClient {
                 "{}/internal/sessions/{session_id}/segments",
                 self.base_url
             ))
-            .header("authorization", self.auth_header())
+            .header("authorization", self.auth_header().await)
             .json(&segments)
             .send()
             .await?;
@@ -346,7 +494,7 @@ impl DataApiClient {
                 "{}/internal/sessions/{session_id}/beats",
                 self.base_url
             ))
-            .header("authorization", self.auth_header())
+            .header("authorization", self.auth_header().await)
             .json(&beats)
             .send()
             .await?;
@@ -366,7 +514,7 @@ impl DataApiClient {
                 "{}/internal/sessions/{session_id}/scenes",
                 self.base_url
             ))
-            .header("authorization", self.auth_header())
+            .header("authorization", self.auth_header().await)
             .json(&scenes)
             .send()
             .await?;
@@ -387,7 +535,7 @@ impl DataApiClient {
         let resp = self
             .client
             .patch(format!("{}/internal/sessions/{session_id}", self.base_url))
-            .header("authorization", self.auth_header())
+            .header("authorization", self.auth_header().await)
             .json(&serde_json::json!({ "status": status }))
             .send()
             .await?;

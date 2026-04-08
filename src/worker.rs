@@ -1,26 +1,34 @@
-//! The worker's main polling loop.
+//! The worker's main event loop.
 //!
 //! # Shape
 //!
+//! The worker connects to the data-api's WebSocket event bus and reacts
+//! to `session_status_changed` events where the new status is `uploaded`.
+//! On disconnect it runs a catchup query (`GET /internal/sessions?status=uploaded`)
+//! and reconnects with exponential backoff (1s, 2s, 4s, ... max 30s).
+//!
+//! The poll-based fallback is still available via the catchup query, so
+//! the system is resilient to WS outages.
+//!
 //! ```text
 //! loop {
-//!     sleep(poll_interval);
-//!     match process_next_session(&state).await {
-//!         Ok(Some(id)) => info!("session_processed"),
-//!         Ok(None)     => continue,         // queue empty
-//!         Err(e)       => error!("process_failed"),
-//!     }
+//!     connect_ws()
+//!     on session_status_changed(uploaded) → process_next_session()
+//!     on disconnect → catchup_query() + reconnect with backoff
 //! }
 //! ```
 //!
 //! Errors never kill the loop — they log and fall through to the next
-//! tick. The worker is expected to run as a long-lived daemon and
-//! recover from transient Data API / Whisper outages on its own.
+//! event / reconnect. The worker is expected to run as a long-lived
+//! daemon and recover from transient Data API / Whisper outages on its
+//! own.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite;
 use uuid::Uuid;
 
 use crate::api_client::{ApiError, Beat, Participant, Scene, Segment, SessionSummary};
@@ -112,36 +120,144 @@ impl PipelineRunner for RealPipelineRunner {
     }
 }
 
+/// WS event payload — only the fields we need to switch on.
+#[derive(serde::Deserialize, Debug)]
+struct WsEvent {
+    event: String,
+    session_id: Option<Uuid>,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+/// Drain all uploaded sessions from the queue (catchup after reconnect).
+async fn drain_uploaded(state: &AppState, runner: &dyn PipelineRunner) {
+    loop {
+        match process_next_session(state, runner).await {
+            Ok(Some(id)) => {
+                tracing::info!(session_id = %id, "catchup session_processed");
+            }
+            Ok(None) => break,
+            Err(e) => {
+                tracing::error!(error = %e, "catchup process_failed");
+                break;
+            }
+        }
+    }
+}
+
 /// Main entrypoint called from `main.rs`. Runs forever.
 ///
-/// Returns `Result` only so `main` can `?` it — in practice this
-/// function never returns `Ok` and only surfaces an error if the
-/// loop itself becomes unrecoverable (which it currently cannot).
+/// Connects to the data-api WS event bus and processes sessions as
+/// events arrive. Falls back to catchup polling on disconnect.
 pub async fn run(state: Arc<AppState>) -> Result<()> {
     let runner: Arc<dyn PipelineRunner> = Arc::new(RealPipelineRunner {
         gm_speaker_id: state.config.gm_speaker_id.clone(),
         scene_llm_url: state.config.scene_llm_url.clone(),
         scene_llm_model: state.config.scene_llm_model.clone(),
     });
-    let poll_interval = Duration::from_secs(state.config.poll_interval_secs);
-    tracing::info!(
-        poll_interval_secs = state.config.poll_interval_secs,
-        "worker loop started"
-    );
+
+    let mut backoff_secs: u64 = 1;
+    const MAX_BACKOFF: u64 = 30;
+
+    tracing::info!("worker event loop starting");
 
     loop {
-        tokio::time::sleep(poll_interval).await;
+        let ws_url = state.api.ws_url().await;
+        tracing::info!(url = %ws_url.split('?').next().unwrap_or(&ws_url), "connecting to data-api WS");
 
-        match process_next_session(&state, runner.as_ref()).await {
-            Ok(Some(id)) => {
-                tracing::info!(session_id = %id, "session_processed");
-            }
-            Ok(None) => {
-                tracing::trace!("no uploaded sessions; idling");
+        match tokio_tungstenite::connect_async(&ws_url).await {
+            Ok((ws_stream, _)) => {
+                // Reset backoff on successful connection
+                backoff_secs = 1;
+                tracing::info!("WS connected, subscribing to sessions/*");
+
+                let (mut ws_tx, mut ws_rx) = ws_stream.split();
+
+                // Subscribe to all session events
+                let sub_msg = serde_json::json!({"subscribe": "sessions"});
+                if let Err(e) = ws_tx.send(tungstenite::Message::Text(sub_msg.to_string().into())).await {
+                    tracing::error!(error = %e, "failed to send subscribe message");
+                    continue;
+                }
+
+                // Run catchup in case we missed events while disconnected
+                drain_uploaded(&state, runner.as_ref()).await;
+
+                // Event loop: react to WS messages
+                loop {
+                    match ws_rx.next().await {
+                        Some(Ok(tungstenite::Message::Text(text))) => {
+                            match serde_json::from_str::<WsEvent>(&text) {
+                                Ok(ws_event) => {
+                                    handle_ws_event(&ws_event, &state, runner.as_ref()).await;
+                                }
+                                Err(e) => {
+                                    tracing::debug!(error = %e, "ignoring unparseable WS message");
+                                }
+                            }
+                        }
+                        Some(Ok(tungstenite::Message::Ping(_))) => {
+                            // tungstenite handles pong automatically
+                        }
+                        Some(Ok(tungstenite::Message::Close(_))) | None => {
+                            tracing::warn!("WS connection closed by server");
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            tracing::warn!(error = %e, "WS receive error");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Catchup after disconnect before reconnecting
+                tracing::info!("running catchup query after WS disconnect");
+                drain_uploaded(&state, runner.as_ref()).await;
             }
             Err(e) => {
-                tracing::error!(error = %e, "process_failed");
+                tracing::warn!(error = %e, backoff_secs, "WS connection failed, retrying");
             }
+        }
+
+        // Exponential backoff before reconnect
+        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+        backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF);
+    }
+}
+
+/// Handle a single WS event from the data-api.
+async fn handle_ws_event(event: &WsEvent, state: &AppState, runner: &dyn PipelineRunner) {
+    match event.event.as_str() {
+        "session_status_changed" => {
+            if event.status.as_deref() == Some("uploaded") {
+                let session_id = event.session_id.map(|id| id.to_string()).unwrap_or_default();
+                tracing::info!(session_id, "session uploaded — triggering processing");
+                match process_next_session(state, runner).await {
+                    Ok(Some(id)) => {
+                        tracing::info!(session_id = %id, "session_processed");
+                    }
+                    Ok(None) => {
+                        tracing::debug!("process_next_session returned None after uploaded event");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "process_failed");
+                    }
+                }
+            }
+        }
+        "chunk_uploaded" => {
+            // TODO: streaming pipeline refactor — when the worker is processing a
+            // session and receives chunk_uploaded events for that session, it should
+            // feed the new chunks into the running pipeline incrementally instead of
+            // waiting for the full upload to complete. For now, just log.
+            if let Some(sid) = event.session_id {
+                tracing::debug!(session_id = %sid, "received chunk_uploaded (not acted on yet)");
+            }
+        }
+        _ => {
+            // Other events (segment_added, beat_detected, etc.) are not actionable
+            // by the worker — they originate from us. Silently ignore.
         }
     }
 }
@@ -235,12 +351,37 @@ pub async fn process_next_session(
         ordered.sort_by_key(|c| c.seq);
 
         let mut raw: Vec<u8> = Vec::new();
-        for chunk in ordered {
-            let bytes = state
+        let mut failed_chunks = 0u32;
+        for chunk in &ordered {
+            match state
                 .api
-                .download_chunk(session_id, pseudo_id, chunk.seq)
-                .await?;
-            raw.extend_from_slice(&bytes);
+                .download_chunk_with_retry(session_id, pseudo_id, chunk.seq)
+                .await
+            {
+                Ok(bytes) => raw.extend_from_slice(&bytes),
+                Err(e) => {
+                    // Log and skip — the pipeline can work with partial
+                    // audio. A missing chunk means a gap in this speaker's
+                    // timeline, not a session failure.
+                    failed_chunks += 1;
+                    tracing::warn!(
+                        session_id = %session_id,
+                        pseudo_id,
+                        chunk_seq = chunk.seq,
+                        error = %e,
+                        "chunk download failed after retries, skipping"
+                    );
+                }
+            }
+        }
+        if failed_chunks > 0 {
+            tracing::warn!(
+                session_id = %session_id,
+                pseudo_id,
+                failed_chunks,
+                total_chunks = ordered.len(),
+                "some chunks could not be downloaded"
+            );
         }
 
         let samples = decode_stereo_to_mono(&raw);
@@ -339,7 +480,18 @@ pub async fn process_next_session(
         "posting_results"
     );
 
-    state.api.post_segments(session_id, segments_out).await?;
+    // Post segments in small batches so the data-api broadcasts
+    // SegmentAdded events progressively and the frontend can render
+    // segments as they arrive instead of waiting for the full batch.
+    // The 50ms delay between batches gives the frontend time to
+    // process and render each batch.
+    for batch in segments_out.chunks(5) {
+        state
+            .api
+            .post_segments(session_id, batch.to_vec())
+            .await?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     if !beats_out.is_empty() {
         state.api.post_beats(session_id, beats_out).await?;
