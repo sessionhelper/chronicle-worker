@@ -685,11 +685,25 @@ async fn finalize_streaming_session(
         "streaming finalize: posting final results"
     );
 
-    // The segments from finalize have been re-indexed and run through
-    // operators (which may exclude some). Post the full operator-processed
-    // set — the data-api handles upsert by segment_index, so duplicates
-    // with streaming segments are safe.
-    post_segments_batched(state, session_id, segments_out).await?;
+    // Only post segments that weren't already posted during streaming.
+    // Streaming posts segments as they're produced (segment_index 0..N).
+    // Finalize re-runs all segments through operators which may modify
+    // text or exclude some. For now, only post the NEW segments (from
+    // flushing remaining VAD state). TODO: update already-posted segments
+    // if operators modified them.
+    let new_segments: Vec<_> = segments_out
+        .into_iter()
+        .filter(|s| s.segment_index >= already_posted as i32)
+        .collect();
+    if !new_segments.is_empty() {
+        tracing::info!(
+            session_id = %session_id,
+            new = new_segments.len(),
+            skipped = already_posted,
+            "posting only new segments from finalize"
+        );
+        post_segments_batched(state, session_id, new_segments).await?;
+    }
 
     if !beats_out.is_empty() {
         state.api.post_beats(session_id, beats_out).await?;
