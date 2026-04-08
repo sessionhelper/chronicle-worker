@@ -166,10 +166,12 @@ struct WsEvent {
     #[serde(default)]
     pseudo_id: Option<String>,
     /// Chunk sequence number (only on `chunk_uploaded`).
-    #[serde(default)]
+    /// Data-api sends `seq`; accept both names.
+    #[serde(default, alias = "seq")]
     chunk_seq: Option<u32>,
     /// Chunk size in bytes (only on `chunk_uploaded`, for logging).
-    #[serde(default)]
+    /// Data-api sends `size`; accept both names.
+    #[serde(default, alias = "size")]
     size_bytes: Option<u64>,
 }
 
