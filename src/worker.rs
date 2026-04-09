@@ -281,6 +281,23 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
     }
 }
 
+/// Build a `TranscriberConfig` with hallucination filtering and quality tuning.
+fn whisper_config(state: &AppState) -> TranscriberConfig {
+    TranscriberConfig {
+        endpoint: state.config.whisper_url.clone(),
+        model: state.config.whisper_model.clone(),
+        language: Some("en".into()),
+        initial_prompt: Some(
+            "TTRPG session dialogue. Multiple speakers discussing combat, exploration, and roleplay.".into(),
+        ),
+        beam_size: 5,
+        temperature: vec![0.0, 0.2, 0.4],
+        hallucination_logprob_threshold: -1.0,
+        hallucination_no_speech_threshold: 0.5,
+        hallucination_compression_ratio: 1.8,
+    }
+}
+
 /// Build a `StreamingConfig` from `AppState` and a session ID.
 fn streaming_config(state: &AppState, session_id: Uuid) -> StreamingConfig {
     StreamingConfig {
@@ -289,11 +306,7 @@ fn streaming_config(state: &AppState, session_id: Uuid) -> StreamingConfig {
             model_path: PathBuf::from(&state.config.vad_model_path),
             ..Default::default()
         },
-        whisper: TranscriberConfig {
-            endpoint: state.config.whisper_url.clone(),
-            model: state.config.whisper_model.clone(),
-            language: Some("en".into()),
-        },
+        whisper: whisper_config(state),
         input_sample_rate: CAPTURE_SAMPLE_RATE,
         session_id,
     }
@@ -876,11 +889,7 @@ pub async fn process_next_session(
             model_path: PathBuf::from(&state.config.vad_model_path),
             ..Default::default()
         },
-        whisper: TranscriberConfig {
-            endpoint: state.config.whisper_url.clone(),
-            model: state.config.whisper_model.clone(),
-            language: Some("en".into()),
-        },
+        whisper: whisper_config(state),
         ..Default::default()
     };
 
