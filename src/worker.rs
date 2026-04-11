@@ -313,7 +313,7 @@ fn streaming_config(state: &AppState, session_id: Uuid) -> StreamingConfig {
 }
 
 /// Build the operator chain from config (shared between batch and streaming).
-fn build_operators(state: &AppState) -> Vec<Box<dyn ovp_pipeline::Operator>> {
+fn build_operators(state: &AppState) -> Vec<Box<dyn chronicle_pipeline::Operator>> {
     match &state.config.scene_llm_url {
         Some(url) => {
             let beat_cfg = BeatConfig {
@@ -335,7 +335,7 @@ fn build_operators(state: &AppState) -> Vec<Box<dyn ovp_pipeline::Operator>> {
 }
 
 /// Convert pipeline `TranscriptSegment`s to the API wire `Segment` type.
-fn to_api_segments(segments: &[ovp_pipeline::TranscriptSegment]) -> Vec<Segment> {
+fn to_api_segments(segments: &[chronicle_pipeline::TranscriptSegment]) -> Vec<Segment> {
     segments
         .iter()
         .map(|s| Segment {
