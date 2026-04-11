@@ -1,4 +1,4 @@
-//! `ovp-worker` binary entrypoint.
+//! `chronicle-worker` binary entrypoint.
 //!
 //! Responsibilities (kept deliberately thin):
 //!
@@ -8,15 +8,15 @@
 //! 4. Build `AppState` and spawn the 30s heartbeat task.
 //! 5. Hand control to `worker::run(state).await`.
 //!
-//! All orchestration lives in [`ovp_worker::worker`].
+//! All orchestration lives in [`chronicle_worker::worker`].
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use ovp_worker::api_client::DataApiClient;
-use ovp_worker::config::Config;
-use ovp_worker::state::AppState;
-use ovp_worker::worker;
+use chronicle_worker::api_client::DataApiClient;
+use chronicle_worker::config::Config;
+use chronicle_worker::state::AppState;
+use chronicle_worker::worker;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -37,14 +37,14 @@ async fn main() -> anyhow_lite::Result<()> {
     tracing::info!(
         data_api = %config.data_api_url,
         poll_interval_secs = config.poll_interval_secs,
-        "ovp-worker starting"
+        "chronicle-worker starting"
     );
 
     // ---- Authenticate ------------------------------------------------
     let api = DataApiClient::authenticate(
         &config.data_api_url,
         &config.shared_secret,
-        "ovp-worker",
+        "chronicle-worker",
     )
     .await
     .map_err(|e| anyhow_lite::err(format!("data api auth failed: {e}")))?;

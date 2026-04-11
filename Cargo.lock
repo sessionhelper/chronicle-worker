@@ -177,6 +177,45 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
+name = "chronicle-pipeline"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ndarray 0.16.1",
+ "ort",
+ "regex",
+ "reqwest",
+ "rubato",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "chronicle-worker"
+version = "0.1.0"
+dependencies = [
+ "chronicle-pipeline",
+ "chrono",
+ "clap",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1163,45 +1202,6 @@ dependencies = [
  "hmac-sha256",
  "lzma-rust2",
  "ureq",
-]
-
-[[package]]
-name = "ovp-pipeline"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "ndarray 0.16.1",
- "ort",
- "regex",
- "reqwest",
- "rubato",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "ovp-worker"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "clap",
- "futures-util",
- "ovp-pipeline",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
- "wiremock",
 ]
 
 [[package]]

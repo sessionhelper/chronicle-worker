@@ -1,7 +1,7 @@
 //! Raw PCM decoding helpers.
 //!
 //! The collector uploads audio as signed 16-bit little-endian stereo PCM
-//! at Discord's native 48kHz rate. `ovp-pipeline` wants mono f32 samples
+//! at Discord's native 48kHz rate. `chronicle-pipeline` wants mono f32 samples
 //! in `[-1.0, 1.0]`. This module owns the conversion and nothing else so
 //! it can be exercised in isolation by unit tests.
 //!

@@ -1,12 +1,12 @@
-# Multi-stage Dockerfile for ovp-worker.
+# Multi-stage Dockerfile for chronicle-worker.
 #
-# Build context MUST be the parent directory containing both ovp-worker/
-# and ovp-pipeline/, because ovp-worker depends on ovp-pipeline via a
-# relative path (../ovp-pipeline in Cargo.toml).
+# Build context MUST be the parent directory containing both chronicle-worker/
+# and chronicle-pipeline/, because chronicle-worker depends on chronicle-pipeline via a
+# relative path (../chronicle-pipeline in Cargo.toml).
 #
 # Build:
 #   cd /home/alex  # or wherever both dirs live side by side
-#   docker build -f ovp-worker/Dockerfile -t ovp-worker:dev .
+#   docker build -f chronicle-worker/Dockerfile -t chronicle-worker:dev .
 #
 # The Silero VAD ONNX model (1.2 MB) is baked into the image at
 # /app/models/silero_vad_v6.onnx. The worker's default VAD_MODEL_PATH
@@ -19,11 +19,11 @@ RUN apt-get update && apt-get install -y cmake && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 
 # Copy both crates preserving the relative path structure that
-# Cargo.toml's `path = "../ovp-pipeline"` expects.
-COPY ovp-pipeline/ ovp-pipeline/
-COPY ovp-worker/ ovp-worker/
+# Cargo.toml's `path = "../chronicle-pipeline"` expects.
+COPY chronicle-pipeline/ chronicle-pipeline/
+COPY chronicle-worker/ chronicle-worker/
 
-WORKDIR /build/ovp-worker
+WORKDIR /build/chronicle-worker
 RUN cargo build --release
 
 FROM debian:bookworm-slim
@@ -41,11 +41,11 @@ RUN curl -sL https://github.com/microsoft/onnxruntime/releases/download/v1.24.4/
     && rm -rf /opt/onnxruntime-linux-x64-1.24.4/include
 ENV ORT_DYLIB_PATH=/opt/onnxruntime-linux-x64-1.24.4/lib/libonnxruntime.so
 
-COPY --from=builder /build/ovp-worker/target/release/ovp-worker /usr/local/bin/ovp-worker
+COPY --from=builder /build/chronicle-worker/target/release/chronicle-worker /usr/local/bin/chronicle-worker
 
 # Bake in the Silero VAD model so the container is self-contained.
-COPY ovp-pipeline/models/silero_vad_v6.onnx /app/models/silero_vad_v6.onnx
+COPY chronicle-pipeline/models/silero_vad_v6.onnx /app/models/silero_vad_v6.onnx
 
 WORKDIR /app
 
-CMD ["ovp-worker"]
+CMD ["chronicle-worker"]

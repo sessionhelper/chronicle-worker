@@ -1,8 +1,8 @@
-# ovp-worker
+# chronicle-worker
 
 > Org-wide conventions (Rust style, git workflow, shared-secret auth, cross-service architecture) live in `/home/alex/sessionhelper-hub/CLAUDE.md`. Read that first for anything cross-cutting. Data flow diagram: `sessionhelper-hub/ARCHITECTURE.md`.
 
-Batch orchestrator: polls Data API for `uploaded` sessions, downloads audio, runs `ovp-pipeline` as a library, posts transcript segments back. Never touches Postgres or S3 directly — everything goes through the Data API.
+Batch orchestrator: polls Data API for `uploaded` sessions, downloads audio, runs `chronicle-pipeline` as a library, posts transcript segments back. Never touches Postgres or S3 directly — everything goes through the Data API.
 
 ## Main loop shape
 
@@ -21,7 +21,7 @@ worker::run:
     }
 ```
 
-`process_next_session` pulls one uploaded session, marks it `transcribing`, filters participants to `consent_scope=full`, downloads all chunks per speaker, decodes s16le stereo -> mono f32, invokes `ovp_pipeline::process_session`, posts segments, marks `transcribed`.
+`process_next_session` pulls one uploaded session, marks it `transcribing`, filters participants to `consent_scope=full`, downloads all chunks per speaker, decodes s16le stereo -> mono f32, invokes `chronicle_pipeline::process_session`, posts segments, marks `transcribed`.
 
 ## Project layout
 
@@ -53,7 +53,7 @@ src/
 ```bash
 cargo build --release
 
-# Docker (build context must include both ovp-worker/ and ovp-pipeline/)
+# Docker (build context must include both chronicle-worker/ and chronicle-pipeline/)
 cd /home/alex
-docker build -f ovp-worker/Dockerfile -t ovp-worker:dev .
+docker build -f chronicle-worker/Dockerfile -t chronicle-worker:dev .
 ```
