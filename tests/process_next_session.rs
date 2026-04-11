@@ -15,11 +15,11 @@
 
 use std::sync::{Arc, Mutex};
 
-use ovp_pipeline::{PipelineConfig, PipelineResult, SessionInput, TranscriptSegment};
-use ovp_worker::api_client::DataApiClient;
-use ovp_worker::config::Config;
-use ovp_worker::state::AppState;
-use ovp_worker::worker::{process_next_session, PipelineRunner};
+use chronicle_pipeline::{PipelineConfig, PipelineResult, SessionInput, TranscriptSegment};
+use chronicle_worker::api_client::DataApiClient;
+use chronicle_worker::config::Config;
+use chronicle_worker::state::AppState;
+use chronicle_worker::worker::{process_next_session, PipelineRunner};
 use serde_json::json;
 use uuid::Uuid;
 use wiremock::matchers::{method, path, path_regex, query_param};
@@ -39,7 +39,7 @@ impl PipelineRunner for CapturingStubRunner {
         input: SessionInput,
     ) -> std::pin::Pin<
         Box<
-            dyn std::future::Future<Output = ovp_pipeline::Result<PipelineResult>> + Send + 'a,
+            dyn std::future::Future<Output = chronicle_pipeline::Result<PipelineResult>> + Send + 'a,
         >,
     > {
         let captured = self.captured.clone();
@@ -201,7 +201,7 @@ async fn happy_path_end_to_end() {
     // during process_next_session) ----
 
     // Build the real client against the mock server.
-    let api = DataApiClient::authenticate(&server.uri(), "test-secret", "ovp-worker-test")
+    let api = DataApiClient::authenticate(&server.uri(), "test-secret", "chronicle-worker-test")
         .await
         .expect("auth");
     let state = AppState::new(Arc::new(api), test_config(server.uri()));

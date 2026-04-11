@@ -35,11 +35,11 @@ use crate::api_client::{ApiError, Beat, Participant, Scene, Segment, SessionSumm
 use crate::decode::decode_stereo_to_mono;
 use crate::state::AppState;
 
-use ovp_pipeline::{
+use chronicle_pipeline::{
     default_operators, operators_with_llm_scene, process_session, PipelineConfig, PipelineResult,
     SessionInput, SpeakerTrack, TranscriberConfig, VadConfig,
 };
-use ovp_pipeline::operators::{beat::BeatConfig, scene::SceneConfig};
+use chronicle_pipeline::operators::{beat::BeatConfig, scene::SceneConfig};
 
 /// Collector-side invariant: all PCM chunks are uploaded as s16le stereo
 /// at Discord's native 48kHz mix rate. The pipeline resamples to 16kHz
@@ -54,14 +54,14 @@ pub enum WorkerError {
     #[error("API error: {0}")]
     Api(#[from] ApiError),
     #[error("Pipeline error: {0}")]
-    Pipeline(#[from] ovp_pipeline::PipelineError),
+    Pipeline(#[from] chronicle_pipeline::PipelineError),
 }
 
 pub type Result<T> = std::result::Result<T, WorkerError>;
 
 /// Abstraction over the pipeline call so integration tests can swap in a
 /// stub without a real Whisper/VAD stack. Production wires
-/// [`RealPipelineRunner`] which calls [`ovp_pipeline::process_session`].
+/// [`RealPipelineRunner`] which calls [`chronicle_pipeline::process_session`].
 ///
 /// Hand-rolled boxed-future return (instead of `async_trait`) keeps the
 /// dependency list tight. Only one trait, one impl, one call site — not
@@ -72,11 +72,11 @@ pub trait PipelineRunner: Send + Sync {
         config: &'a PipelineConfig,
         input: SessionInput,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = ovp_pipeline::Result<PipelineResult>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = chronicle_pipeline::Result<PipelineResult>> + Send + 'a>,
     >;
 }
 
-/// Real production pipeline runner. Delegates to `ovp_pipeline::process_session`
+/// Real production pipeline runner. Delegates to `chronicle_pipeline::process_session`
 /// with the operator chain chosen from config.
 pub struct RealPipelineRunner {
     /// GM speaker id for LLM beat/scene operators, if configured.
@@ -94,7 +94,7 @@ impl PipelineRunner for RealPipelineRunner {
         config: &'a PipelineConfig,
         input: SessionInput,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = ovp_pipeline::Result<PipelineResult>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = chronicle_pipeline::Result<PipelineResult>> + Send + 'a>,
     > {
         Box::pin(async move {
             let mut operators = match &self.scene_llm_url {
@@ -409,7 +409,7 @@ pub async fn process_next_session(
         return Ok(Some(session_id));
     }
 
-    // ---- 4. Invoke ovp-pipeline --------------------------------------
+    // ---- 4. Invoke chronicle-pipeline --------------------------------------
     let pipeline_config = PipelineConfig {
         vad: VadConfig {
             model_path: PathBuf::from(&state.config.vad_model_path),

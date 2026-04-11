@@ -1,6 +1,6 @@
-//! HTTP client for `ovp-data-api`.
+//! HTTP client for `chronicle-data-api`.
 //!
-//! Mirrors the idioms in `ttrpg-collector/voice-capture/src/api_client.rs`
+//! Mirrors the idioms in `chronicle-bot/voice-capture/src/api_client.rs`
 //! (shared-secret auth → session token → Bearer on every request, 30s
 //! heartbeat, `check_status` helper). Code is not shared across crates
 //! — each service owns its own slimmed-down copy with just the methods
@@ -125,7 +125,7 @@ pub struct ChunkInfo {
 
 /// Transcript segment posted back to the Data API after pipeline processing.
 ///
-/// Wire format matches `ovp-data-api/src/routes/segments.rs` ->
+/// Wire format matches `chronicle-data-api/src/routes/segments.rs` ->
 /// `bulk_create_segments` (a bare JSON array of `CreateSegment`). Field
 /// types are `i32`/`f64` to match the DB column types — not `usize`/`f32`
 /// which would force conversions on both sides.

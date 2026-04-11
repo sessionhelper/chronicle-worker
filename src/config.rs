@@ -6,13 +6,13 @@
 
 use clap::Parser;
 
-/// Runtime configuration for `ovp-worker`.
+/// Runtime configuration for `chronicle-worker`.
 ///
 /// All fields are populated from environment variables. `clap` is used
 /// purely for its env + derive machinery; the worker does not take any
 /// command-line flags today.
 #[derive(Debug, Clone, Parser)]
-#[command(name = "ovp-worker", about = "Batch transcription worker")]
+#[command(name = "chronicle-worker", about = "Batch transcription worker")]
 pub struct Config {
     /// Base URL of the Data API (no trailing slash).
     #[arg(long, env = "DATA_API_URL", default_value = "http://127.0.0.1:8001")]
@@ -27,16 +27,16 @@ pub struct Config {
     #[arg(long, env = "POLL_INTERVAL_SECS", default_value_t = 10)]
     pub poll_interval_secs: u64,
 
-    /// Tracing filter string (e.g. `info`, `ovp_worker=debug,warn`).
+    /// Tracing filter string (e.g. `info`, `chronicle_worker=debug,warn`).
     #[arg(long, env = "LOG_LEVEL", default_value = "info")]
     pub log_level: String,
 
     // ---- Pipeline knobs -----------------------------------------------
-    // These belong to ovp-pipeline, not the worker's own loop. They're
+    // These belong to chronicle-pipeline, not the worker's own loop. They're
     // plumbed here because the worker is the caller that constructs
     // `PipelineConfig`. If the worker ever grows a proper config file,
     // these should move into a nested `[pipeline]` section.
-    /// Whisper HTTP endpoint used by `ovp-pipeline`.
+    /// Whisper HTTP endpoint used by `chronicle-pipeline`.
     #[arg(
         long,
         env = "WHISPER_URL",

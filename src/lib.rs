@@ -1,6 +1,6 @@
-//! ovp-worker: batch orchestrator that turns captured audio chunks into
+//! chronicle-worker: batch orchestrator that turns captured audio chunks into
 //! transcripts. Polls the Data API for `uploaded` sessions, downloads
-//! audio, runs `ovp-pipeline` as a library, posts segments back.
+//! audio, runs `chronicle-pipeline` as a library, posts segments back.
 //!
 //! This crate never touches Postgres or S3 directly — every persistence
 //! operation goes through the Data API over HTTP. See
