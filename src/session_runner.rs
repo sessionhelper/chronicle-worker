@@ -288,12 +288,15 @@ async fn run_one_shot(inputs: SessionInputs) -> Result<()> {
         return Ok(());
     }
 
+    tracing::info!(%session, "one-shot: building pipeline");
     let pipeline = build_pipeline(&cfg)?;
+    tracing::info!(%session, "one-shot: pipeline built, running");
     let audio = SessionAudio {
         session_id: session.as_uuid(),
         tracks,
     };
     let output = pipeline.run_one_shot(audio).await?;
+    tracing::info!(%session, "one-shot: pipeline done");
 
     let mut posted: HashSet<Uuid> = HashSet::new();
     write_new_outputs(&api, session, &output, &mut posted).await?;
