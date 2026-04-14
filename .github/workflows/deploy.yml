@@ -37,17 +37,19 @@ jobs:
 
       - name: Pick pipeline ref
         id: pipe
+        # Pipeline is a path dep on worker; refs must move together.
+        # Mapping:
+        #   worker refactor/** → pipeline refactor/pipeline-features-pass
+        #   anything else     → pipeline main
+        # If a specific mapping fails (ref missing), fall back to main.
         run: |
           set -euo pipefail
+          CANDIDATE="main"
           if [[ "$GITHUB_REF" == refs/heads/refactor/* ]]; then
-            # Prefer a matching pipeline refactor branch if one exists,
-            # else fall back to main.
-            BRANCH="${GITHUB_REF#refs/heads/}"
-            if git ls-remote --exit-code --heads https://github.com/sessionhelper/chronicle-pipeline.git "$BRANCH" >/dev/null 2>&1; then
-              echo "ref=$BRANCH" >> "$GITHUB_OUTPUT"
-            else
-              echo "ref=main" >> "$GITHUB_OUTPUT"
-            fi
+            CANDIDATE="refactor/pipeline-features-pass"
+          fi
+          if git ls-remote --exit-code --heads https://github.com/sessionhelper/chronicle-pipeline.git "$CANDIDATE" >/dev/null 2>&1; then
+            echo "ref=$CANDIDATE" >> "$GITHUB_OUTPUT"
           else
             echo "ref=main" >> "$GITHUB_OUTPUT"
           fi
