@@ -1,74 +1,77 @@
 //! Per-session processing task.
 //!
-//! The event loop creates one `SessionRunner` per active session. Each
-//! runner owns its `StreamingPipeline` and runs in its own tokio task,
-//! reading commands (feed chunk / finalize) from an mpsc channel.
+//! The event loop creates one runner per active session. Each runner owns
+//! its `Pipeline` (chronicle-pipeline's unified streaming/one-shot handle)
+//! and runs in its own tokio task, reading `RunnerCmd`s from an mpsc
+//! channel.
 //!
 //! # State machine
 //!
 //! ```text
-//!     [Streaming] --finalize()--> [Finalizing] --done--> [Done]
-//!          |                              |
-//!          +----- one-shot path -----> [OneShotRunning] -> [Done]
+//!     [Streaming] --Finalize--> write outputs + PATCH transcribed --> [Done]
+//!        |   \---- Abort -----> discard pipeline state              --> [Done]
+//!
+//!     [OneShot]                 download all chunks, run_one_shot,
+//!                               write outputs + PATCH transcribed   --> [Done]
 //! ```
 //!
-//! The runner never "decides" state from an if-ladder; the public API
-//! takes the initial mode (`Streaming` or `OneShot`) and the task loop
-//! is a `match` on a small enum in each iteration.
+//! The runner never decides state from an if-ladder — the initial mode
+//! selects a dedicated async fn, and the streaming fn's per-iteration
+//! decision is a `match` on `RunnerCmd`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use chronicle_pipeline::operators::{beat::BeatConfig, scene::SceneConfig};
 use chronicle_pipeline::{
-    default_operators, operators_with_llm_scene, process_session, Operator, PipelineConfig,
-    PipelineResult, SessionInput, SpeakerTrack, StreamingConfig, StreamingPipeline, VadConfig,
+    AudioChunk, Beat, OperatorKind, Pipeline, PipelineConfig, PipelineOutput, Scene, Segment,
+    SessionAudio, SessionTrack, Timestamp, VadConfig,
 };
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
-use crate::api_client::{BeatWire, DataApiClient, SceneWire, SegmentWire};
+use crate::api_client::{CreateInputWire, DataApiClient};
 use crate::config::{Config, CAPTURE_SAMPLE_RATE};
-use crate::decode::decode_stereo_to_mono;
+use crate::decode::decode_stereo_to_mono_i16;
 use crate::error::{Result, WorkerError};
 use crate::ids::{PseudoId, Seq, SessionId};
-use crate::whisper::whisper_config;
+use crate::whisper::HttpWhisperClient;
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
 
 /// Control messages the event loop sends to a running `SessionRunner`.
 pub enum RunnerCmd {
-    /// A new chunk is ready to be ingested. The runner downloads +
-    /// decodes it on its own thread to keep the event loop free.
+    /// A new chunk is ready to be ingested. The runner fetches + decodes
+    /// it on its own task to keep the event loop free.
     IngestChunk { pseudo: PseudoId, seq: Seq },
-    /// Finalize the streaming pipeline and write outputs. Shuts the
-    /// runner down on completion.
+    /// Session has moved to `uploaded`. Finalize the streaming pipeline
+    /// and write outputs, then shut down.
     Finalize,
     /// Forceful shutdown (drop pipeline state without writing).
     Abort,
 }
 
-/// The mode the runner was constructed in. Spec §"Pipeline lifecycle per session".
+/// Runner mode chosen at spawn time. Spec §"Pipeline lifecycle per session".
+#[derive(Debug, Clone, Copy)]
 pub enum RunnerMode {
-    /// Streaming — spec's normal case. Chunks arrive via `IngestChunk`;
+    /// Streaming — spec normal case. Chunks arrive via `IngestChunk`;
     /// `Finalize` flushes remaining state and writes outputs.
     Streaming,
-    /// One-shot — spec's rerun / orphan-recovery case. The runner
-    /// downloads every chunk up front and runs `process_session`.
+    /// One-shot — spec rerun / orphan-recovery case. The runner
+    /// downloads every chunk up front and runs `Pipeline::run_one_shot`.
     OneShot,
 }
 
-/// Handle returned to the event loop.
-///
-/// The `join` field is the raw `JoinHandle` that the event loop moves
-/// into its `JoinSet` to observe completion. `tx` is retained for
-/// command dispatch (ingest, finalize, abort).
+/// Handle returned to the event loop. `join` is observed by the loop's
+/// `JoinSet`; `tx` is retained for `IngestChunk` / `Finalize` / `Abort`.
 pub struct SessionHandle {
     pub session: SessionId,
     pub tx: mpsc::Sender<RunnerCmd>,
     pub join: tokio::task::JoinHandle<Result<()>>,
 }
 
-/// Inputs needed to spawn a runner.
 pub struct SessionInputs {
     pub api: Arc<DataApiClient>,
     pub cfg: Arc<Config>,
@@ -91,7 +94,9 @@ async fn run(inputs: SessionInputs, rx: mpsc::Receiver<RunnerCmd>) -> Result<()>
     }
 }
 
-// --- Streaming path ------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Streaming path
+// ---------------------------------------------------------------------------
 
 async fn run_streaming(
     inputs: SessionInputs,
@@ -99,29 +104,20 @@ async fn run_streaming(
 ) -> Result<()> {
     let SessionInputs { api, cfg, session, .. } = inputs;
 
-    let stream_cfg = StreamingConfig {
-        rms: Default::default(),
-        vad: VadConfig {
-            model_path: PathBuf::from(&cfg.vad_model_path),
-            ..Default::default()
-        },
-        whisper: whisper_config(&cfg),
-        input_sample_rate: CAPTURE_SAMPLE_RATE,
-        session_id: session.as_uuid(),
-    };
-    let mut pipeline = StreamingPipeline::new(stream_cfg);
+    let mut pipeline = build_pipeline(&cfg)?;
 
-    // Ordered buffer of already-seen chunks per speaker. Guards against
-    // duplicate events and out-of-order arrivals (WS does not guarantee
-    // cross-speaker ordering, though the spec's intra-session ordering
-    // is claimed).
+    // Per-speaker bookkeeping. WS ordering within a single speaker is
+    // guaranteed by data-api; across speakers we still sort by seq.
+    // `processed` filters duplicate WS events; `pending` holds
+    // out-of-order buffer; `next_expected` tracks the next seq to hand
+    // to the pipeline.
     let mut processed: HashMap<String, HashSet<u32>> = HashMap::new();
     let mut pending: HashMap<String, BTreeMap<u32, Vec<u8>>> = HashMap::new();
     let mut next_expected: HashMap<String, u32> = HashMap::new();
 
-    // Segments already POSTed during streaming — so finalize doesn't
-    // double-post them.
-    let mut posted_count: u32 = 0;
+    // Segment IDs we've already POSTed during the streaming phase, so
+    // finalize doesn't re-send them.
+    let mut posted_segment_ids: HashSet<Uuid> = HashSet::new();
 
     tracing::info!(%session, "session_runner: streaming started");
 
@@ -138,7 +134,7 @@ async fn run_streaming(
                     &mut processed,
                     &mut pending,
                     &mut next_expected,
-                    &mut posted_count,
+                    &mut posted_segment_ids,
                 )
                 .await
                 {
@@ -147,7 +143,7 @@ async fn run_streaming(
             }
             RunnerCmd::Finalize => {
                 drop(rx); // stop accepting new chunks
-                return finalize_streaming(api, cfg, session, pipeline, posted_count).await;
+                return finalize_streaming(api, session, pipeline, posted_segment_ids).await;
             }
             RunnerCmd::Abort => {
                 tracing::info!(%session, "session_runner: aborted");
@@ -165,77 +161,77 @@ async fn ingest_one(
     session: SessionId,
     pseudo: &PseudoId,
     seq: Seq,
-    pipeline: &mut StreamingPipeline,
+    pipeline: &mut Pipeline,
     processed: &mut HashMap<String, HashSet<u32>>,
     pending: &mut HashMap<String, BTreeMap<u32, Vec<u8>>>,
     next_expected: &mut HashMap<String, u32>,
-    posted_count: &mut u32,
+    posted_segment_ids: &mut HashSet<Uuid>,
 ) -> Result<()> {
-    let seen = processed.entry(pseudo.as_str().to_string()).or_default();
+    let pkey = pseudo.as_str().to_string();
+    let seen = processed.entry(pkey.clone()).or_default();
     if seen.contains(&seq.as_u32()) {
         return Ok(());
     }
 
     let bytes = api.download_chunk(session, pseudo, seq).await?;
-    let samples = decode_stereo_to_mono(&bytes);
 
-    // Order buffer.
-    let next = next_expected.entry(pseudo.as_str().to_string()).or_insert(0);
-    let buf = pending.entry(pseudo.as_str().to_string()).or_default();
+    let next = next_expected.entry(pkey.clone()).or_insert(0);
+    let buf = pending.entry(pkey.clone()).or_default();
 
     if seq.as_u32() != *next {
         buf.insert(seq.as_u32(), bytes);
-        tracing::debug!(%session, pseudo = %pseudo, seq = %seq, expected = *next, "buffered out-of-order chunk");
+        tracing::debug!(
+            %session, pseudo = %pseudo, seq = %seq, expected = *next,
+            "buffered out-of-order chunk"
+        );
         return Ok(());
     }
 
-    // Feed this and any consecutive buffered chunks.
-    let mut to_feed: Vec<(u32, Vec<f32>)> = vec![(seq.as_u32(), samples)];
+    // Feed this chunk + any consecutive buffered ones.
+    let mut ordered: Vec<(u32, Vec<u8>)> = vec![(seq.as_u32(), bytes)];
     *next = seq.as_u32() + 1;
     while let Some(b) = buf.remove(next) {
-        let s = decode_stereo_to_mono(&b);
-        to_feed.push((*next, s));
+        ordered.push((*next, b));
         *next += 1;
     }
 
-    let mut new_segments = Vec::new();
-    for (s, samples) in to_feed {
-        if samples.is_empty() {
-            seen.insert(s);
+    for (s, raw) in ordered {
+        let pcm = decode_stereo_to_mono_i16(&raw);
+        seen.insert(s);
+        if pcm.is_empty() {
             continue;
         }
-        match pipeline.feed_chunk(pseudo.as_str(), samples).await {
-            Ok(mut segs) => {
-                seen.insert(s);
-                new_segments.append(&mut segs);
-            }
-            Err(e) => {
-                tracing::warn!(%session, pseudo = %pseudo, seq = s, error = %e, "feed_chunk failed");
-                seen.insert(s);
-            }
+        let duration_ms =
+            ((pcm.len() as u64) * 1000 / CAPTURE_SAMPLE_RATE as u64) as u32;
+        let chunk = AudioChunk {
+            session_id: session.as_uuid(),
+            pseudo_id: pseudo.as_str().to_string(),
+            seq: s,
+            capture_started_at: 0 as Timestamp,
+            duration_ms,
+            pcm: Arc::from(pcm),
+        };
+        if let Err(e) = pipeline.ingest_chunk(chunk).await {
+            tracing::warn!(%session, pseudo = %pseudo, seq = s, error = %e, "ingest_chunk failed");
         }
     }
 
-    if !new_segments.is_empty() {
-        let wire = to_segment_wires(&new_segments);
-        post_segments_chunked(api, session, &wire).await?;
-        *posted_count += wire.len() as u32;
-    }
+    // Drain whatever is ready mid-stream.
+    let drained = pipeline.emit();
+    write_new_outputs(api, session, &drained, posted_segment_ids).await?;
+
     Ok(())
 }
 
 async fn finalize_streaming(
     api: Arc<DataApiClient>,
-    cfg: Arc<Config>,
     session: SessionId,
-    pipeline: StreamingPipeline,
-    already_posted: u32,
+    pipeline: Pipeline,
+    mut posted_segment_ids: HashSet<Uuid>,
 ) -> Result<()> {
     let start = Instant::now();
 
-    // Claim before finalizing. The atomic claim is the contract: first
-    // worker that PATCHes to `transcribing` wins. A 409 surfaces as
-    // `ClaimLost` — we drop the session silently.
+    // Claim before finalizing. Atomic: 409 → ClaimLost → drop silently.
     match api.claim_session(session).await {
         Ok(()) => {}
         Err(WorkerError::ClaimLost(_)) => {
@@ -245,47 +241,33 @@ async fn finalize_streaming(
         Err(e) => return Err(e),
     }
 
-    let mut operators = build_operators(&cfg);
-    let result = pipeline.finalize(&mut operators).await?;
+    let output = pipeline.finalize().await?;
+    let segs_total = output.segments.len();
+    let beats_total = output.beats.len();
+    let scenes_total = output.scenes.len();
 
-    // Only POST the segments that weren't emitted during streaming
-    // (by segment_index). The final `result.segments` vec is re-indexed
-    // chronologically after sort; we rely on the count diff to know how
-    // many are "new".
-    let all_segs = to_segment_wires(&result.segments);
-    let new_segs: Vec<_> = all_segs
-        .into_iter()
-        .filter(|s| s.segment_index >= already_posted as i32)
-        .collect();
-    post_segments_chunked(&api, session, &new_segs).await?;
-
-    let beats = to_beat_wires(&result.beats);
-    let scenes = to_scene_wires(&result.scenes);
-    api.post_beats(session, &beats).await?;
-    api.post_scenes(session, &scenes).await?;
-
+    write_new_outputs(&api, session, &output, &mut posted_segment_ids).await?;
     api.mark_transcribed(session).await?;
 
     tracing::info!(
         %session,
-        segs_total = result.segments.len(),
-        new_segs = new_segs.len(),
-        beats = beats.len(),
-        scenes = scenes.len(),
+        segs_total, beats_total, scenes_total,
         elapsed_ms = start.elapsed().as_millis() as u64,
         "session finalized (streaming)"
     );
     Ok(())
 }
 
-// --- One-shot path -------------------------------------------------------
+// ---------------------------------------------------------------------------
+// One-shot path
+// ---------------------------------------------------------------------------
 
 async fn run_one_shot(inputs: SessionInputs) -> Result<()> {
     let SessionInputs { api, cfg, session, .. } = inputs;
     let start = Instant::now();
 
-    // Claim (idempotent for orphan recovery: transcribing -> transcribing
-    // is accepted as a no-op transition by the data-api state machine).
+    // Claim — idempotent for orphan recovery (transcribing → transcribing
+    // is an accepted no-op per the data-api state machine).
     match api.claim_session(session).await {
         Ok(()) => {}
         Err(WorkerError::ClaimLost(_)) => {
@@ -295,47 +277,37 @@ async fn run_one_shot(inputs: SessionInputs) -> Result<()> {
         Err(e) => return Err(e),
     }
 
-    // Build the one-shot input by downloading every chunk per consented speaker.
     let tracks = collect_speaker_tracks(&api, session).await?;
     if tracks.is_empty() {
-        tracing::warn!(%session, "one-shot: no tracks, marking transcribed");
+        tracing::warn!(%session, "one-shot: no tracks; marking transcribed");
         api.mark_transcribed(session).await?;
         return Ok(());
     }
 
-    let pipeline_cfg = PipelineConfig {
-        vad: VadConfig {
-            model_path: PathBuf::from(&cfg.vad_model_path),
-            ..Default::default()
-        },
-        whisper: whisper_config(&cfg),
-        ..Default::default()
+    let pipeline = build_pipeline(&cfg)?;
+    let audio = SessionAudio {
+        session_id: session.as_uuid(),
+        tracks,
     };
+    let output = pipeline.run_one_shot(audio).await?;
 
-    let mut operators = build_operators(&cfg);
-    let result = process_session(
-        &pipeline_cfg,
-        SessionInput { session_id: session.as_uuid(), tracks },
-        &mut operators,
-    )
-    .await?;
-
-    write_outputs(&api, session, &result).await?;
+    let mut posted: HashSet<Uuid> = HashSet::new();
+    write_new_outputs(&api, session, &output, &mut posted).await?;
     api.mark_transcribed(session).await?;
 
     tracing::info!(
         %session,
-        segs = result.segments.len(),
-        beats = result.beats.len(),
-        scenes = result.scenes.len(),
+        segs = output.segments.len(),
+        beats = output.beats.len(),
+        scenes = output.scenes.len(),
         elapsed_ms = start.elapsed().as_millis() as u64,
         "session finalized (one-shot)"
     );
     Ok(())
 }
 
-/// Clear any prior pipeline outputs for a session (used on admin rerun
-/// to guarantee idempotency).
+/// Clear any prior pipeline outputs for a session. Used on admin rerun
+/// to guarantee idempotency of the subsequent one-shot run.
 pub async fn clear_prior_outputs(api: &DataApiClient, session: SessionId) -> Result<()> {
     let (segs, beats, scenes) = tokio::join!(
         api.list_segment_ids(session),
@@ -346,19 +318,65 @@ pub async fn clear_prior_outputs(api: &DataApiClient, session: SessionId) -> Res
     let beats = beats.unwrap_or_default();
     let scenes = scenes.unwrap_or_default();
 
-    for id in segs { let _ = api.delete_segment(id).await; }
-    for id in beats { let _ = api.delete_beat(id).await; }
-    for id in scenes { let _ = api.delete_scene(id).await; }
+    for id in segs {
+        let _ = api.delete_segment(id).await;
+    }
+    for id in beats {
+        let _ = api.delete_beat(id).await;
+    }
+    for id in scenes {
+        let _ = api.delete_scene(id).await;
+    }
     Ok(())
 }
 
-/// Download + decode all consented speakers' chunks into `SpeakerTrack`s.
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn build_pipeline(cfg: &Config) -> Result<Pipeline> {
+    let whisper = HttpWhisperClient::from_config(cfg)
+        .map_err(|e| WorkerError::Config(format!("whisper: {e}")))?;
+
+    let pcfg = PipelineConfig {
+        operators: operator_chain(cfg),
+        vad: VadConfig {
+            model_path: Some(std::path::PathBuf::from(&cfg.vad_model_path)),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    Pipeline::builder(pcfg)
+        .whisper(Arc::new(whisper))
+        .build()
+        .map_err(WorkerError::from)
+}
+
+/// The worker always runs VAD → Transcription → Filter → Segment → MetaTalk.
+/// Beats + Scenes are enabled only when a scene-LLM endpoint is configured,
+/// matching the spec's "LLM is optional" stance.
+fn operator_chain(cfg: &Config) -> Vec<OperatorKind> {
+    let mut ops = vec![
+        OperatorKind::Vad,
+        OperatorKind::Transcription,
+        OperatorKind::Filter,
+        OperatorKind::Segment,
+        OperatorKind::MetaTalk,
+    ];
+    if cfg.scene_llm_url.is_some() {
+        ops.push(OperatorKind::Beats);
+        ops.push(OperatorKind::Scenes);
+    }
+    ops
+}
+
 async fn collect_speaker_tracks(
     api: &DataApiClient,
     session: SessionId,
-) -> Result<Vec<SpeakerTrack>> {
+) -> Result<Vec<SessionTrack>> {
     let participants = api.list_participants(session).await?;
-    let consented: Vec<_> = participants
+    let consented: Vec<String> = participants
         .into_iter()
         .filter_map(|p| {
             let pid = p.user_pseudo_id?;
@@ -371,44 +389,68 @@ async fn collect_speaker_tracks(
     for pid in consented {
         let pseudo = PseudoId::new(pid.clone());
         let mut chunks = api.list_chunks(session, &pseudo).await?;
-        if chunks.is_empty() { continue; }
+        if chunks.is_empty() {
+            continue;
+        }
         chunks.sort_by_key(|c| c.seq);
 
         let mut raw = Vec::new();
         for c in &chunks {
             match api.download_chunk(session, &pseudo, Seq::new(c.seq)).await {
                 Ok(b) => raw.extend_from_slice(&b),
-                Err(e) => tracing::warn!(%session, pseudo = %pseudo, seq = c.seq, error = %e, "skip chunk"),
+                Err(e) => {
+                    tracing::warn!(%session, pseudo = %pseudo, seq = c.seq, error = %e, "skip chunk");
+                }
             }
         }
-        let samples = decode_stereo_to_mono(&raw);
-        tracks.push(SpeakerTrack {
+        let pcm = decode_stereo_to_mono_i16(&raw);
+        tracks.push(SessionTrack {
             pseudo_id: pid,
-            samples,
-            sample_rate: CAPTURE_SAMPLE_RATE,
+            capture_started_at: 0 as Timestamp,
+            pcm: Arc::from(pcm),
         });
     }
     Ok(tracks)
 }
 
-async fn write_outputs(
+/// Post only the outputs we haven't posted before. Segment dedup is via
+/// the segment's pipeline-assigned UUID (stable across `emit()` +
+/// `finalize()`); beats and scenes only show up at finalize so we post
+/// them unconditionally when the streaming fn's last call drains them.
+async fn write_new_outputs(
     api: &DataApiClient,
     session: SessionId,
-    result: &PipelineResult,
+    out: &PipelineOutput,
+    posted_segment_ids: &mut HashSet<Uuid>,
 ) -> Result<()> {
-    let segs = to_segment_wires(&result.segments);
-    let beats = to_beat_wires(&result.beats);
-    let scenes = to_scene_wires(&result.scenes);
-    post_segments_chunked(api, session, &segs).await?;
-    api.post_beats(session, &beats).await?;
-    api.post_scenes(session, &scenes).await?;
+    let new_segments: Vec<&Segment> = out
+        .segments
+        .iter()
+        .filter(|s| !posted_segment_ids.contains(&s.id))
+        .collect();
+    if !new_segments.is_empty() {
+        let wires: Vec<CreateInputWire> = new_segments.iter().map(|s| segment_wire(s)).collect();
+        post_segments_chunked(api, session, &wires).await?;
+        for s in &new_segments {
+            posted_segment_ids.insert(s.id);
+        }
+    }
+
+    if !out.beats.is_empty() {
+        let wires: Vec<CreateInputWire> = out.beats.iter().map(beat_wire).collect();
+        api.post_beats(session, &wires).await?;
+    }
+    if !out.scenes.is_empty() {
+        let wires: Vec<CreateInputWire> = out.scenes.iter().map(scene_wire).collect();
+        api.post_scenes(session, &wires).await?;
+    }
     Ok(())
 }
 
 async fn post_segments_chunked(
     api: &DataApiClient,
     session: SessionId,
-    segs: &[SegmentWire],
+    segs: &[CreateInputWire],
 ) -> Result<()> {
     for batch in segs.chunks(5) {
         api.post_segments(session, batch).await?;
@@ -417,74 +459,60 @@ async fn post_segments_chunked(
     Ok(())
 }
 
-// --- Conversions ---------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Wire conversions
+// ---------------------------------------------------------------------------
 
-fn to_segment_wires(segs: &[chronicle_pipeline::TranscriptSegment]) -> Vec<SegmentWire> {
-    segs.iter()
-        .map(|s| SegmentWire {
-            segment_index: s.segment_index as i32,
-            speaker_pseudo_id: s.speaker_pseudo_id.clone(),
-            start_time: s.start_time as f64,
-            end_time: s.end_time as f64,
-            text: s.text.clone(),
-            original_text: s.original_text.clone(),
-            confidence: s.confidence.map(|c| c as f64),
-            beat_id: s.beat_id.map(|b| b as i32),
-            chunk_group: s.chunk_group.map(|c| c as i32),
-            excluded: s.excluded,
-            exclude_reason: s.exclude_reason.clone(),
-        })
-        .collect()
-}
-
-fn to_beat_wires(beats: &[chronicle_pipeline::PipelineBeat]) -> Vec<BeatWire> {
-    beats
-        .iter()
-        .map(|b| BeatWire {
-            beat_index: b.beat_index as i32,
-            start_time: b.start_time as f64,
-            end_time: b.end_time as f64,
-            title: b.title.clone(),
-            summary: b.summary.clone(),
-        })
-        .collect()
-}
-
-fn to_scene_wires(scenes: &[chronicle_pipeline::PipelineScene]) -> Vec<SceneWire> {
-    scenes
-        .iter()
-        .map(|s| SceneWire {
-            scene_index: s.scene_index as i32,
-            start_time: s.start_time as f64,
-            end_time: s.end_time as f64,
-            title: s.title.clone(),
-            summary: s.summary.clone(),
-            beat_start: s.beat_start as i32,
-            beat_end: s.beat_end as i32,
-        })
-        .collect()
-}
-
-// --- Operator chain ------------------------------------------------------
-
-fn build_operators(cfg: &Config) -> Vec<Box<dyn Operator>> {
-    match &cfg.scene_llm_url {
-        Some(url) => {
-            let beat_cfg = BeatConfig {
-                endpoint: url.clone(),
-                model: cfg.scene_llm_model.clone(),
-                gm_speaker_id: cfg.gm_speaker_id.clone(),
-                ..Default::default()
-            };
-            let scene_cfg = SceneConfig {
-                endpoint: url.clone(),
-                model: cfg.scene_llm_model.clone(),
-                gm_speaker_id: cfg.gm_speaker_id.clone(),
-                ..Default::default()
-            };
-            operators_with_llm_scene(beat_cfg, scene_cfg)
-        }
-        None => default_operators(),
+fn segment_wire(s: &Segment) -> CreateInputWire {
+    let flags = s
+        .flags
+        .meta_talk
+        .as_ref()
+        .map(|mt| serde_json::json!({ "meta_talk": mt }));
+    CreateInputWire {
+        client_id: s.id.to_string(),
+        start_ms: s.start_ms as i64,
+        end_ms: s.end_ms as i64,
+        pseudo_id: Some(s.pseudo_id.clone()),
+        text: Some(s.text.clone()),
+        title: None,
+        summary: None,
+        confidence: Some(s.confidence as f64),
+        flags,
+        original: Some(serde_json::json!({
+            "text": s.original,
+            "confidence": s.confidence,
+            "language": s.language,
+        })),
     }
 }
 
+fn beat_wire(b: &Beat) -> CreateInputWire {
+    CreateInputWire {
+        client_id: b.id.to_string(),
+        start_ms: b.t_ms as i64,
+        end_ms: b.t_ms as i64,
+        pseudo_id: None,
+        text: None,
+        title: Some(b.label.clone()),
+        summary: Some(format!("{:?}", b.kind)),
+        confidence: Some(b.confidence as f64),
+        flags: None,
+        original: None,
+    }
+}
+
+fn scene_wire(s: &Scene) -> CreateInputWire {
+    CreateInputWire {
+        client_id: s.id.to_string(),
+        start_ms: s.start_ms as i64,
+        end_ms: s.end_ms as i64,
+        pseudo_id: None,
+        text: None,
+        title: Some(s.label.clone()),
+        summary: Some(String::new()),
+        confidence: Some(s.confidence as f64),
+        flags: None,
+        original: None,
+    }
+}

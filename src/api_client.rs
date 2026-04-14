@@ -63,44 +63,28 @@ pub struct ChunkInfo {
     pub size: i64,
 }
 
-/// Transcript segment wire payload (matches data-api's bulk-insert body).
+/// Bulk-insert row for segments/beats/scenes. Data-api's
+/// `uniform::CreateInput`: client_id-keyed, dedup'd on `(session_id,
+/// client_id)`. Segments set `text`; beats/scenes set `title` + `summary`.
 #[derive(Serialize, Debug, Clone)]
-pub struct SegmentWire {
-    pub segment_index: i32,
-    pub speaker_pseudo_id: String,
-    pub start_time: f64,
-    pub end_time: f64,
-    pub text: String,
-    pub original_text: String,
+pub struct CreateInputWire {
+    pub client_id: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pseudo_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub beat_id: Option<i32>,
+    pub flags: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub chunk_group: Option<i32>,
-    #[serde(default)]
-    pub excluded: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub exclude_reason: Option<String>,
-}
-
-#[derive(Serialize, Debug, Clone)]
-pub struct BeatWire {
-    pub beat_index: i32,
-    pub start_time: f64,
-    pub end_time: f64,
-    pub title: String,
-    pub summary: String,
-}
-
-#[derive(Serialize, Debug, Clone)]
-pub struct SceneWire {
-    pub scene_index: i32,
-    pub start_time: f64,
-    pub end_time: f64,
-    pub title: String,
-    pub summary: String,
-    pub beat_start: i32,
-    pub beat_end: i32,
+    pub original: Option<serde_json::Value>,
 }
 
 /// Per-session IDs returned by list-segments (used for DELETE on rerun).
@@ -351,42 +335,35 @@ impl DataApiClient {
 
     // ----- Output writes -------------------------------------------------
 
-    pub async fn post_segments(&self, id: SessionId, segs: &[SegmentWire]) -> Result<()> {
-        if segs.is_empty() { return Ok(()); }
-        let url = format!("{}/internal/sessions/{}/segments", self.base_url, id);
-        let resp = self
-            .http
-            .post(url)
-            .header("authorization", self.auth_header().await)
-            .json(segs)
-            .send()
-            .await?;
-        check_ok(resp).await?;
-        Ok(())
+    pub async fn post_segments(&self, id: SessionId, segs: &[CreateInputWire]) -> Result<()> {
+        self.bulk_insert(id, "segments", segs).await
     }
 
-    pub async fn post_beats(&self, id: SessionId, beats: &[BeatWire]) -> Result<()> {
-        if beats.is_empty() { return Ok(()); }
-        let url = format!("{}/internal/sessions/{}/beats", self.base_url, id);
-        let resp = self
-            .http
-            .post(url)
-            .header("authorization", self.auth_header().await)
-            .json(beats)
-            .send()
-            .await?;
-        check_ok(resp).await?;
-        Ok(())
+    pub async fn post_beats(&self, id: SessionId, beats: &[CreateInputWire]) -> Result<()> {
+        self.bulk_insert(id, "beats", beats).await
     }
 
-    pub async fn post_scenes(&self, id: SessionId, scenes: &[SceneWire]) -> Result<()> {
-        if scenes.is_empty() { return Ok(()); }
-        let url = format!("{}/internal/sessions/{}/scenes", self.base_url, id);
+    pub async fn post_scenes(&self, id: SessionId, scenes: &[CreateInputWire]) -> Result<()> {
+        self.bulk_insert(id, "scenes", scenes).await
+    }
+
+    /// Shared bulk-insert handler. Data-api expects the body to be wrapped
+    /// under the resource kind (`{ "segments": [...] }`); each entry must
+    /// carry a `client_id` for idempotent dedup.
+    async fn bulk_insert(
+        &self,
+        id: SessionId,
+        kind: &str,
+        rows: &[CreateInputWire],
+    ) -> Result<()> {
+        if rows.is_empty() { return Ok(()); }
+        let url = format!("{}/internal/sessions/{}/{}", self.base_url, id, kind);
+        let body = serde_json::json!({ kind: rows });
         let resp = self
             .http
             .post(url)
             .header("authorization", self.auth_header().await)
-            .json(scenes)
+            .json(&body)
             .send()
             .await?;
         check_ok(resp).await?;
