@@ -48,11 +48,7 @@ impl HttpWhisperClient {
             endpoint: cfg.whisper_url.clone(),
             model: cfg.whisper_model.clone(),
             language: Some("en".into()),
-            initial_prompt: Some(
-                "TTRPG session dialogue. Multiple speakers discussing combat, \
-                 exploration, and roleplay."
-                    .into(),
-            ),
+            initial_prompt: cfg.whisper_initial_prompt.clone(),
             temperature: 0.0,
         })
     }

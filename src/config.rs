@@ -44,6 +44,13 @@ pub struct Config {
     #[arg(long, env = "WHISPER_MODEL", default_value = "Systran/faster-whisper-large-v3")]
     pub whisper_model: String,
 
+    /// Optional Whisper `initial_prompt`. Short phrase primes the model
+    /// with domain vocabulary (character names, jargon) so short
+    /// utterances with invented words aren't mis-spelled. `None` = no
+    /// prompt sent.
+    #[arg(long, env = "WHISPER_INITIAL_PROMPT")]
+    pub whisper_initial_prompt: Option<String>,
+
     /// Silero VAD ONNX model path.
     #[arg(long, env = "VAD_MODEL_PATH", default_value = "models/silero_vad_v6.onnx")]
     pub vad_model_path: String,
