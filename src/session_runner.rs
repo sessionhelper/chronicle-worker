@@ -24,8 +24,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use chronicle_pipeline::{
-    AudioChunk, Beat, OperatorKind, Pipeline, PipelineConfig, PipelineOutput, Scene, Segment,
-    SessionAudio, SessionTrack, Timestamp, VadConfig,
+    AudioChunk, Beat, FilterConfig, OperatorKind, Pipeline, PipelineConfig, PipelineOutput, Scene,
+    Segment, SessionAudio, SessionTrack, Timestamp, VadConfig,
 };
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -353,6 +353,11 @@ fn build_pipeline(cfg: &Config) -> Result<Pipeline> {
             min_speech_ms: cfg.vad_min_speech_ms,
             min_silence_ms: cfg.vad_min_silence_ms,
             pad_ms: cfg.vad_pad_ms,
+        },
+        filter: FilterConfig {
+            min_confidence: cfg.filter_min_confidence,
+            max_cps: cfg.filter_max_cps,
+            min_alpha_chars: cfg.filter_min_alpha,
         },
         ..Default::default()
     };

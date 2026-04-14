@@ -68,6 +68,21 @@ pub struct Config {
     #[arg(long, env = "VAD_PAD_MS", default_value_t = 100)]
     pub vad_pad_ms: u32,
 
+    /// Minimum Whisper avg_logprob to keep a region. More negative =
+    /// more permissive (worse transcripts slip through).
+    #[arg(long, env = "FILTER_MIN_CONFIDENCE", default_value_t = -1.5)]
+    pub filter_min_confidence: f32,
+
+    /// Max characters-per-second before we suspect a Whisper artefact.
+    /// Default 25 rejects short legitimate utterances (14 chars in 468ms
+    /// = 29.9 cps). 35 leaves headroom for brief one-liners.
+    #[arg(long, env = "FILTER_MAX_CPS", default_value_t = 35.0)]
+    pub filter_max_cps: f32,
+
+    /// Minimum alphabetic character count to keep a region.
+    #[arg(long, env = "FILTER_MIN_ALPHA", default_value_t = 2)]
+    pub filter_min_alpha: usize,
+
     /// Enable the admin HTTP surface.
     #[arg(long, env = "WORKER_ADMIN_ENABLED", default_value_t = false)]
     pub admin_enabled: bool,
