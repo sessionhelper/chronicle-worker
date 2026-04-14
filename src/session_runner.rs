@@ -379,7 +379,7 @@ async fn collect_speaker_tracks(
     let consented: Vec<String> = participants
         .into_iter()
         .filter_map(|p| {
-            let pid = p.user_pseudo_id?;
+            let pid = p.pseudo_id?;
             let scope = p.consent_scope?;
             (scope == "full").then_some(pid)
         })

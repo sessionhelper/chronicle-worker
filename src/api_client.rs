@@ -47,8 +47,11 @@ pub struct SessionDetail {
 #[derive(Deserialize, Debug, Clone)]
 pub struct Participant {
     pub id: Uuid,
-    #[serde(default)]
-    pub user_pseudo_id: Option<String>,
+    // Data-api returns `pseudo_id`. Older snapshots called it
+    // `user_pseudo_id`; alias kept so mixed-version deployments don't
+    // silently drop participants.
+    #[serde(default, alias = "user_pseudo_id")]
+    pub pseudo_id: Option<String>,
     #[serde(default)]
     pub consent_scope: Option<String>,
 }
