@@ -265,11 +265,13 @@ async fn finalize_streaming(
 async fn run_one_shot(inputs: SessionInputs) -> Result<()> {
     let SessionInputs { api, cfg, session, .. } = inputs;
     let start = Instant::now();
+    tracing::info!(%session, "one-shot: entering run");
 
     // Claim — idempotent for orphan recovery (transcribing → transcribing
     // is an accepted no-op per the data-api state machine).
+    tracing::info!(%session, "one-shot: claiming");
     match api.claim_session(session).await {
-        Ok(()) => {}
+        Ok(()) => tracing::info!(%session, "one-shot: claimed"),
         Err(WorkerError::ClaimLost(_)) => {
             tracing::info!(%session, "one-shot: claim lost, peer owns it");
             return Ok(());
@@ -277,7 +279,9 @@ async fn run_one_shot(inputs: SessionInputs) -> Result<()> {
         Err(e) => return Err(e),
     }
 
+    tracing::info!(%session, "one-shot: collecting tracks");
     let tracks = collect_speaker_tracks(&api, session).await?;
+    tracing::info!(%session, n_tracks = tracks.len(), "one-shot: tracks collected");
     if tracks.is_empty() {
         tracing::warn!(%session, "one-shot: no tracks; marking transcribed");
         api.mark_transcribed(session).await?;
