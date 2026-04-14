@@ -176,7 +176,7 @@ impl DataApiClient {
         } else {
             self.base_url.replacen("http", "ws", 1)
         };
-        format!("{ws_base}/ws?token={token}")
+        format!("{ws_base}/internal/ws?token={token}")
     }
 
     /// Unauthenticated base URL accessor (used by admin status).
