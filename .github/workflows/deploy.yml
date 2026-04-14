@@ -1,0 +1,95 @@
+name: Build & Deploy
+
+# Image tag semantics:
+#   :sha-<short>        — every push
+#   :branch-<sanitized> — pushes to main or refactor/** (for targeted dev smoke)
+#   :dev, :latest, :v*  — only on version-tag pushes (the "canonical release")
+#
+# Worker's Dockerfile expects chronicle-pipeline as a sibling directory in
+# the build context. We check out BOTH repos side-by-side into a shared
+# parent dir and build from there.
+#
+# Pipeline branch used for the build:
+#   - If this worker ref is a branch, use the matching branch on pipeline
+#     (best-effort, falls back to main)
+#   - On version tags, use pipeline main
+#
+# Prod SSH deploy runs ONLY on version tags (and prod doesn't actually
+# run the worker yet — gated on its own future rollout).
+
+on:
+  push:
+    branches: [main, 'refactor/**']
+    tags: ['v*']
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out chronicle-worker
+        uses: actions/checkout@v4
+        with:
+          path: build-context/chronicle-worker
+
+      - name: Pick pipeline ref
+        id: pipe
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/heads/refactor/* ]]; then
+            # Prefer a matching pipeline refactor branch if one exists,
+            # else fall back to main.
+            BRANCH="${GITHUB_REF#refs/heads/}"
+            if git ls-remote --exit-code --heads https://github.com/sessionhelper/chronicle-pipeline.git "$BRANCH" >/dev/null 2>&1; then
+              echo "ref=$BRANCH" >> "$GITHUB_OUTPUT"
+            else
+              echo "ref=main" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "ref=main" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out chronicle-pipeline
+        uses: actions/checkout@v4
+        with:
+          repository: sessionhelper/chronicle-pipeline
+          ref: ${{ steps.pipe.outputs.ref }}
+          path: build-context/chronicle-pipeline
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${{ github.repository }}"
+          SHORT="${GITHUB_SHA::7}"
+          TAGS="$IMAGE:sha-$SHORT"
+          if [[ "$GITHUB_REF" == refs/heads/* ]]; then
+            BRANCH="${GITHUB_REF#refs/heads/}"
+            SANITIZED="$(echo "$BRANCH" | tr '/' '-')"
+            TAGS="$TAGS,$IMAGE:branch-$SANITIZED"
+          fi
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+            TAGS="$TAGS,$IMAGE:dev,$IMAGE:latest,$IMAGE:$VERSION"
+          fi
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          push: true
+          context: build-context
+          file: build-context/chronicle-worker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.tags.outputs.tags }}
