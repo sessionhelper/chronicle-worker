@@ -1,6 +1,6 @@
 [package]
 name = "chronicle-worker"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [lib]
@@ -11,7 +11,7 @@ name = "chronicle-worker"
 path = "src/main.rs"
 
 [dependencies]
-chronicle-pipeline = { path = "../chronicle-pipeline", features = ["vad", "transcribe"] }
+chronicle-pipeline = { path = "../chronicle-pipeline", features = ["vad"] }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
@@ -25,6 +25,9 @@ thiserror = "2"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 url = "2"
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json"] }
+tower = "0.5"
 
 [dev-dependencies]
 wiremock = "0.6"
+tokio = { version = "1", features = ["full", "test-util"] }
