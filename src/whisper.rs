@@ -32,6 +32,9 @@ pub struct HttpWhisperClient {
     language: Option<String>,
     initial_prompt: Option<String>,
     temperature: f32,
+    beam_size: u32,
+    no_speech_threshold: f32,
+    compression_ratio_threshold: f32,
 }
 
 impl HttpWhisperClient {
@@ -49,7 +52,10 @@ impl HttpWhisperClient {
             model: cfg.whisper_model.clone(),
             language: Some("en".into()),
             initial_prompt: cfg.whisper_initial_prompt.clone(),
-            temperature: 0.0,
+            temperature: cfg.whisper_temperature,
+            beam_size: cfg.whisper_beam_size,
+            no_speech_threshold: cfg.whisper_no_speech_threshold,
+            compression_ratio_threshold: cfg.whisper_compression_ratio_threshold,
         })
     }
 }
@@ -92,6 +98,13 @@ impl WhisperClient for HttpWhisperClient {
             .text("model", self.model.clone())
             .text("response_format", "json")
             .text("temperature", self.temperature.to_string())
+            // faster-whisper-server extensions (OpenAI-compatible). Beam
+            // search vs greedy drastically reduces short-clip substitution
+            // errors; the two thresholds cut hallucinations on
+            // near-silent regions.
+            .text("beam_size", self.beam_size.to_string())
+            .text("no_speech_threshold", self.no_speech_threshold.to_string())
+            .text("compression_ratio_threshold", self.compression_ratio_threshold.to_string())
             .part(
                 "file",
                 multipart::Part::bytes(wav)

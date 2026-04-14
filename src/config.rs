@@ -51,6 +51,26 @@ pub struct Config {
     #[arg(long, env = "WHISPER_INITIAL_PROMPT")]
     pub whisper_initial_prompt: Option<String>,
 
+    /// Sampling temperature. 0.0 = deterministic beam search; higher
+    /// temperatures add exploration (and noise).
+    #[arg(long, env = "WHISPER_TEMPERATURE", default_value_t = 0.0)]
+    pub whisper_temperature: f32,
+
+    /// Beam width. 1 = greedy (fastest, more errors). 5 = typical OpenAI
+    /// default (best quality / latency trade). >5 has diminishing returns.
+    #[arg(long, env = "WHISPER_BEAM_SIZE", default_value_t = 5)]
+    pub whisper_beam_size: u32,
+
+    /// Probability threshold above which a region is classified as pure
+    /// silence and skipped. 0.6 is the faster-whisper default.
+    #[arg(long, env = "WHISPER_NO_SPEECH_THRESHOLD", default_value_t = 0.6)]
+    pub whisper_no_speech_threshold: f32,
+
+    /// gzip compression ratio ceiling. Transcripts above this are treated
+    /// as hallucinations (repetition). 2.4 is the faster-whisper default.
+    #[arg(long, env = "WHISPER_COMPRESSION_RATIO_THRESHOLD", default_value_t = 2.4)]
+    pub whisper_compression_ratio_threshold: f32,
+
     /// Silero VAD ONNX model path.
     #[arg(long, env = "VAD_MODEL_PATH", default_value = "models/silero_vad_v6.onnx")]
     pub vad_model_path: String,
