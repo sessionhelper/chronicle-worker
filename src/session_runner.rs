@@ -349,7 +349,10 @@ fn build_pipeline(cfg: &Config) -> Result<Pipeline> {
         operators: operator_chain(cfg),
         vad: VadConfig {
             model_path: Some(std::path::PathBuf::from(&cfg.vad_model_path)),
-            ..Default::default()
+            threshold: cfg.vad_threshold,
+            min_speech_ms: cfg.vad_min_speech_ms,
+            min_silence_ms: cfg.vad_min_silence_ms,
+            pad_ms: cfg.vad_pad_ms,
         },
         ..Default::default()
     };

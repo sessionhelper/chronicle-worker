@@ -48,6 +48,26 @@ pub struct Config {
     #[arg(long, env = "VAD_MODEL_PATH", default_value = "models/silero_vad_v6.onnx")]
     pub vad_model_path: String,
 
+    /// Silero probability threshold (0.0-1.0). Lower = more permissive.
+    /// Silero's own README uses 0.5 for clean audio; 0.3 is typical for
+    /// Discord's lossy DAVE-decrypted Opus.
+    #[arg(long, env = "VAD_THRESHOLD", default_value_t = 0.5)]
+    pub vad_threshold: f32,
+
+    /// Minimum continuous speech in a region before emitting. Shorter =
+    /// more short utterances make it to Whisper.
+    #[arg(long, env = "VAD_MIN_SPEECH_MS", default_value_t = 250)]
+    pub vad_min_speech_ms: u32,
+
+    /// Silence that ends a speech region. Longer = merges short pauses.
+    #[arg(long, env = "VAD_MIN_SILENCE_MS", default_value_t = 800)]
+    pub vad_min_silence_ms: u32,
+
+    /// Padding prepended/appended to each emitted region. Helps Whisper
+    /// not clip the start/end consonants.
+    #[arg(long, env = "VAD_PAD_MS", default_value_t = 100)]
+    pub vad_pad_ms: u32,
+
     /// Enable the admin HTTP surface.
     #[arg(long, env = "WORKER_ADMIN_ENABLED", default_value_t = false)]
     pub admin_enabled: bool,
