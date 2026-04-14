@@ -59,10 +59,11 @@ pub struct Participant {
 #[derive(Deserialize, Debug, Clone)]
 pub struct ChunkInfo {
     #[allow(dead_code)]
+    #[serde(rename = "s3_key")]
     pub key: String,
     pub seq: u32,
     #[allow(dead_code)]
-    #[serde(default)]
+    #[serde(default, rename = "size_bytes")]
     pub size: i64,
 }
 
