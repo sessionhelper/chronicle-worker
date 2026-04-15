@@ -65,6 +65,13 @@ pub struct ChunkInfo {
     #[allow(dead_code)]
     #[serde(default, rename = "size_bytes")]
     pub size: i64,
+    /// Wall-clock instant the bot first sampled audio for this chunk.
+    /// Returned by data-api as RFC3339; we use it as the pipeline's
+    /// `Timestamp` (millis since epoch) so VAD regions, transcripts,
+    /// and the live-mix all share one timeline. Default `None` keeps
+    /// us compatible with older data-api builds during rolling upgrades.
+    #[serde(default)]
+    pub capture_started_at: Option<DateTime<Utc>>,
 }
 
 /// Bulk-insert row for segments/beats/scenes. Data-api's
