@@ -28,6 +28,8 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim
 
+ARG TARGETARCH
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
@@ -36,10 +38,21 @@ RUN apt-get update \
 # feature for Silero VAD inference. Downloaded once at image build time.
 # ort-sys 2.0.0-rc.12 targets ONNX Runtime 1.24. Using an older version
 # (e.g. 1.19 or 1.23) causes a silent deadlock during model loading.
-RUN curl -sL https://github.com/microsoft/onnxruntime/releases/download/v1.24.4/onnxruntime-linux-x64-1.24.4.tgz \
-    | tar xz -C /opt/ \
-    && rm -rf /opt/onnxruntime-linux-x64-1.24.4/include
-ENV ORT_DYLIB_PATH=/opt/onnxruntime-linux-x64-1.24.4/lib/libonnxruntime.so
+#
+# Architecture must match the runtime host. Loading the x64 .so on an
+# aarch64 host ALSO produces a silent deadlock (no dlopen error surfaces
+# up to the ort crate).
+RUN set -e; \
+    case "${TARGETARCH:-amd64}" in \
+      amd64) ORT_ARCH=x64 ;; \
+      arm64) ORT_ARCH=aarch64 ;; \
+      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -sL "https://github.com/microsoft/onnxruntime/releases/download/v1.24.4/onnxruntime-linux-${ORT_ARCH}-1.24.4.tgz" \
+      | tar xz -C /opt/ \
+    && rm -rf "/opt/onnxruntime-linux-${ORT_ARCH}-1.24.4/include" \
+    && ln -s "/opt/onnxruntime-linux-${ORT_ARCH}-1.24.4" /opt/onnxruntime
+ENV ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so
 
 COPY --from=builder /build/chronicle-worker/target/release/chronicle-worker /usr/local/bin/chronicle-worker
 

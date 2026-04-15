@@ -1,66 +1,139 @@
-//! Worker configuration.
+//! Worker configuration, env-driven.
 //!
-//! Parsed from environment variables via `clap` derive. Every env var
-//! has a sensible default except `DATA_API_SHARED_SECRET`, which is
-//! required for service-to-service auth.
+//! Matches `chronicle-worker.md` §Interfaces.Environment-variables.
+//!
+//! Two naming quirks kept for backward compatibility with the running
+//! fleet: `DATA_API_SHARED_SECRET` is still accepted as an alias for
+//! `SHARED_SECRET`, and `LOG_LEVEL` still maps to the `RUST_LOG`-style
+//! filter. New code should prefer the spec-canonical names.
+
+use std::net::SocketAddr;
+use std::time::Duration;
 
 use clap::Parser;
 
-/// Runtime configuration for `chronicle-worker`.
-///
-/// All fields are populated from environment variables. `clap` is used
-/// purely for its env + derive machinery; the worker does not take any
-/// command-line flags today.
+/// Fixed capture rate across the bot fleet (Discord native).
+pub const CAPTURE_SAMPLE_RATE: u32 = 48_000;
+
+/// Worker runtime configuration.
 #[derive(Debug, Clone, Parser)]
-#[command(name = "chronicle-worker", about = "Batch transcription worker")]
+#[command(name = "chronicle-worker", about = "Chronicle transcription worker")]
 pub struct Config {
-    /// Base URL of the Data API (no trailing slash).
+    /// Data API base URL (no trailing slash).
     #[arg(long, env = "DATA_API_URL", default_value = "http://127.0.0.1:8001")]
     pub data_api_url: String,
 
-    /// Shared secret used for service-to-service auth with the Data API.
-    /// Must match the `SHARED_SECRET` env var on the Data API container.
-    #[arg(long, env = "DATA_API_SHARED_SECRET")]
-    pub shared_secret: String,
+    /// Shared secret for data-api auth. Accepts either spec-canonical
+    /// `SHARED_SECRET` or legacy `DATA_API_SHARED_SECRET`.
+    #[arg(long, env = "SHARED_SECRET")]
+    pub shared_secret: Option<String>,
 
-    /// How often to poll for new `uploaded` sessions, in seconds.
+    /// Legacy alias (same as `SHARED_SECRET`).
+    #[arg(long = "legacy-shared-secret", env = "DATA_API_SHARED_SECRET")]
+    pub legacy_shared_secret: Option<String>,
+
+    /// REST reconciliation interval (safety net when WS is down).
     #[arg(long, env = "POLL_INTERVAL_SECS", default_value_t = 10)]
     pub poll_interval_secs: u64,
 
-    /// Tracing filter string (e.g. `info`, `chronicle_worker=debug,warn`).
-    #[arg(long, env = "LOG_LEVEL", default_value = "info")]
-    pub log_level: String,
-
-    // ---- Pipeline knobs -----------------------------------------------
-    // These belong to chronicle-pipeline, not the worker's own loop. They're
-    // plumbed here because the worker is the caller that constructs
-    // `PipelineConfig`. If the worker ever grows a proper config file,
-    // these should move into a nested `[pipeline]` section.
-    /// Whisper HTTP endpoint used by `chronicle-pipeline`.
-    #[arg(
-        long,
-        env = "WHISPER_URL",
-        default_value = "http://localhost:8300/v1/audio/transcriptions"
-    )]
+    /// Whisper HTTP endpoint.
+    #[arg(long, env = "WHISPER_URL", default_value = "http://localhost:8300/v1/audio/transcriptions")]
     pub whisper_url: String,
 
     /// Whisper model identifier.
-    #[arg(
-        long,
-        env = "WHISPER_MODEL",
-        default_value = "deepdml/faster-whisper-large-v3-turbo-ct2"
-    )]
+    #[arg(long, env = "WHISPER_MODEL", default_value = "Systran/faster-whisper-large-v3")]
     pub whisper_model: String,
 
-    /// Path to the Silero VAD ONNX model on disk.
+    /// Optional Whisper `initial_prompt`. Short phrase primes the model
+    /// with domain vocabulary (character names, jargon) so short
+    /// utterances with invented words aren't mis-spelled. `None` = no
+    /// prompt sent.
+    #[arg(long, env = "WHISPER_INITIAL_PROMPT")]
+    pub whisper_initial_prompt: Option<String>,
+
+    /// Sampling temperature. 0.0 = deterministic beam search; higher
+    /// temperatures add exploration (and noise).
+    #[arg(long, env = "WHISPER_TEMPERATURE", default_value_t = 0.0)]
+    pub whisper_temperature: f32,
+
+    /// Beam width. 1 = greedy (fastest, more errors). 5 = typical OpenAI
+    /// default (best quality / latency trade). >5 has diminishing returns.
+    #[arg(long, env = "WHISPER_BEAM_SIZE", default_value_t = 5)]
+    pub whisper_beam_size: u32,
+
+    /// Probability threshold above which a region is classified as pure
+    /// silence and skipped. 0.6 is the faster-whisper default.
+    #[arg(long, env = "WHISPER_NO_SPEECH_THRESHOLD", default_value_t = 0.6)]
+    pub whisper_no_speech_threshold: f32,
+
+    /// gzip compression ratio ceiling. Transcripts above this are treated
+    /// as hallucinations (repetition). 2.4 is the faster-whisper default.
+    #[arg(long, env = "WHISPER_COMPRESSION_RATIO_THRESHOLD", default_value_t = 2.4)]
+    pub whisper_compression_ratio_threshold: f32,
+
+    /// Silero VAD ONNX model path.
     #[arg(long, env = "VAD_MODEL_PATH", default_value = "models/silero_vad_v6.onnx")]
     pub vad_model_path: String,
+
+    /// Silero probability threshold (0.0-1.0). Lower = more permissive.
+    /// Silero's own README uses 0.5 for clean audio; 0.3 is typical for
+    /// Discord's lossy DAVE-decrypted Opus.
+    #[arg(long, env = "VAD_THRESHOLD", default_value_t = 0.5)]
+    pub vad_threshold: f32,
+
+    /// Minimum continuous speech in a region before emitting. Shorter =
+    /// more short utterances make it to Whisper.
+    #[arg(long, env = "VAD_MIN_SPEECH_MS", default_value_t = 250)]
+    pub vad_min_speech_ms: u32,
+
+    /// Silence that ends a speech region. Longer = merges short pauses.
+    #[arg(long, env = "VAD_MIN_SILENCE_MS", default_value_t = 800)]
+    pub vad_min_silence_ms: u32,
+
+    /// Padding prepended/appended to each emitted region. Helps Whisper
+    /// not clip the start/end consonants.
+    #[arg(long, env = "VAD_PAD_MS", default_value_t = 100)]
+    pub vad_pad_ms: u32,
+
+    /// Minimum Whisper avg_logprob to keep a region. More negative =
+    /// more permissive (worse transcripts slip through).
+    #[arg(long, env = "FILTER_MIN_CONFIDENCE", default_value_t = -1.5)]
+    pub filter_min_confidence: f32,
+
+    /// Max characters-per-second before we suspect a Whisper artefact.
+    /// Default 25 rejects short legitimate utterances (14 chars in 468ms
+    /// = 29.9 cps). 35 leaves headroom for brief one-liners.
+    #[arg(long, env = "FILTER_MAX_CPS", default_value_t = 35.0)]
+    pub filter_max_cps: f32,
+
+    /// Minimum alphabetic character count to keep a region.
+    #[arg(long, env = "FILTER_MIN_ALPHA", default_value_t = 2)]
+    pub filter_min_alpha: usize,
+
+    /// Enable the admin HTTP surface.
+    #[arg(long, env = "WORKER_ADMIN_ENABLED", default_value_t = false)]
+    pub admin_enabled: bool,
+
+    /// Admin HTTP bind address (loopback by default).
+    #[arg(long, env = "ADMIN_BIND_ADDR", default_value = "127.0.0.1:8020")]
+    pub admin_bind_addr: SocketAddr,
+
+    /// Session-level retry backoffs in milliseconds, CSV.
+    /// Defaults to the spec's 30s / 2m / 10m.
+    #[arg(long, env = "RETRY_BACKOFF_MS", default_value = "30000,120000,600000")]
+    pub retry_backoff_ms: String,
+
+    /// Tracing filter (falls back to RUST_LOG if present).
+    #[arg(long, env = "LOG_LEVEL", default_value = "chronicle_worker=info,chronicle_pipeline=info")]
+    pub log_level: String,
+
+    // -- Pipeline knobs forwarded to chronicle-pipeline ------------------
 
     /// Optional LLM endpoint for scene detection.
     #[arg(long, env = "SCENE_LLM_URL")]
     pub scene_llm_url: Option<String>,
 
-    /// Optional LLM model name for scene detection.
+    /// LLM model name for scene detection.
     #[arg(long, env = "SCENE_LLM_MODEL", default_value = "qwen2.5:7b")]
     pub scene_llm_model: String,
 
@@ -70,8 +143,38 @@ pub struct Config {
 }
 
 impl Config {
-    /// Parse configuration from the process environment.
-    pub fn from_env() -> Self {
-        Self::parse()
+    /// Parse from the process environment.
+    pub fn from_env() -> Self { Self::parse() }
+
+    /// The effective shared secret, preferring the canonical env var.
+    pub fn resolved_shared_secret(&self) -> std::result::Result<&str, crate::error::WorkerError> {
+        self.shared_secret
+            .as_deref()
+            .or(self.legacy_shared_secret.as_deref())
+            .ok_or_else(|| {
+                crate::error::WorkerError::Config(
+                    "SHARED_SECRET (or DATA_API_SHARED_SECRET) must be set".into(),
+                )
+            })
+    }
+
+    /// Parsed retry schedule, exposed as `Duration`s so callers don't
+    /// re-parse the CSV.
+    pub fn retry_backoffs(&self) -> std::result::Result<Vec<Duration>, crate::error::WorkerError> {
+        self.retry_backoff_ms
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.parse::<u64>()
+                    .map(Duration::from_millis)
+                    .map_err(|e| crate::error::WorkerError::Config(format!("RETRY_BACKOFF_MS: {e}")))
+            })
+            .collect()
+    }
+
+    /// REST poll interval as a `Duration`.
+    pub fn poll_interval(&self) -> Duration {
+        Duration::from_secs(self.poll_interval_secs)
     }
 }
