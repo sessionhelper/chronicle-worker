@@ -203,6 +203,11 @@ async fn ingest_one(
         }
         let duration_ms =
             ((pcm.len() as u64) * 1000 / CAPTURE_SAMPLE_RATE as u64) as u32;
+        // Streaming mode only sees the WS event payload + the chunk
+        // bytes; capture_started_at would need to be added to the
+        // `ChunkUploaded` event (and to data-api's bus serialization)
+        // before we can plumb it here. One-shot mode has the full
+        // ChunkInfo list and does set this — see `collect_speaker_tracks`.
         let chunk = AudioChunk {
             session_id: session.as_uuid(),
             pseudo_id: pseudo.as_str().to_string(),
@@ -419,9 +424,17 @@ async fn collect_speaker_tracks(
             }
         }
         let pcm = decode_stereo_to_mono_i16(&raw);
+        // Track timeline starts at the first chunk's capture instant so
+        // VAD regions / transcripts on this track are placed on the
+        // shared session clock instead of all anchored at 0.
+        let capture_started_at = chunks
+            .first()
+            .and_then(|c| c.capture_started_at)
+            .map(|d| d.timestamp_millis())
+            .unwrap_or(0) as Timestamp;
         tracks.push(SessionTrack {
             pseudo_id: pid,
-            capture_started_at: 0 as Timestamp,
+            capture_started_at,
             pcm: Arc::from(pcm),
         });
     }
