@@ -523,11 +523,27 @@ fn beat_wire(b: &Beat) -> CreateInputWire {
         pseudo_id: None,
         text: None,
         title: Some(b.label.clone()),
-        summary: Some(format!("{:?}", b.kind)),
+        summary: Some(beat_kind_label(&b.kind)),
         confidence: Some(b.confidence as f64),
         flags: None,
         original: None,
     }
+}
+
+/// Human-readable kind name. The pipeline emits enum variants; the
+/// portal renders them, and `format!("{:?}", kind)` produced
+/// `"CombatStart"` / `"DialogueClimax"` which are awkward to read.
+fn beat_kind_label(kind: &chronicle_pipeline::BeatKind) -> String {
+    use chronicle_pipeline::BeatKind::*;
+    match kind {
+        CombatStart => "Combat begins",
+        CombatEnd => "Combat ends",
+        Discovery => "Discovery",
+        DialogueClimax => "Dialogue climax",
+        SceneBreak => "Scene break",
+        Unknown => "Unknown beat",
+    }
+    .to_string()
 }
 
 fn scene_wire(s: &Scene) -> CreateInputWire {
