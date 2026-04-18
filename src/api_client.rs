@@ -196,13 +196,32 @@ impl DataApiClient {
     // ----- Heartbeat -----------------------------------------------------
 
     pub async fn heartbeat(&self) -> Result<()> {
+        let url = format!("{}/internal/heartbeat", self.base_url);
         let resp = self
             .http
-            .post(format!("{}/internal/heartbeat", self.base_url))
+            .post(&url)
             .header("authorization", self.auth_header().await)
             .send()
             .await?;
-        check_ok(resp).await?;
+        // One-shot re-auth on 401 — the session token TTL is 90s on the
+        // data-api side and we heartbeat every 30s, but the bot's restart
+        // (or a reaper tick) can still invalidate the token between two
+        // heartbeats. Without this, the 30s heartbeat just logs the 401
+        // forever and the WS / other calls start failing too. Mirrors the
+        // same one-shot re-auth pattern chunk-download uses.
+        if resp.status() == StatusCode::UNAUTHORIZED {
+            tracing::info!("heartbeat got 401 — re-authenticating and retrying");
+            self.re_authenticate().await?;
+            let retry = self
+                .http
+                .post(&url)
+                .header("authorization", self.auth_header().await)
+                .send()
+                .await?;
+            check_ok(retry).await?;
+        } else {
+            check_ok(resp).await?;
+        }
         Ok(())
     }
 
